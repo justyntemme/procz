@@ -1,0 +1,22 @@
+.{
+    .name = .procz,
+    .version = "0.1.0",
+    .fingerprint = 0x434d539eaa412a7b,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{ "src", "lib", "build.zig", "build.zig.zon" },
+    .dependencies = .{
+        .sokol = .{
+            .url = "git+https://github.com/floooh/sokol-zig.git#17beeab59a64b12c307a07a9a674cee563fd5835",
+            .hash = "sokol-0.1.0-pb1HKy2pNgB35RMsyiFOdS_NRxFGy_2hA7abaqRTihI1",
+            .lazy = false,
+        },
+        .zclay = .{
+            .url = "git+https://github.com/johan0A/clay-zig-bindings#6247096649f547a55e90dcdc1e821c72186f6d09",
+            .hash = "zclay-0.2.2-Ej1rkPDRAADuk7U5Y1YjpoFfE5Puvf5JIDyyjtnz3aVc",
+        },
+        .spsc_queue = .{
+            .url = "git+https://github.com/freref/spsc-queue#3ce8a39c53b026ef42eb569e66bc04c6356869e8",
+            .hash = "spsc_queue-0.0.0-AVEoh1VJAAAANyL-T7uKYvwDBTU9R0i42Avs_Bp-43wr",
+        },
+    },
+}

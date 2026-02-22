@@ -80,6 +80,7 @@ pub const InteractionState = struct {
     search_focused: bool = false,
     cursor_visible: bool = true,
     active_tab: ActiveTab = .processes,
+    viewport_height: f32 = 600,
 };
 
 pub const MenuState = struct {
@@ -308,16 +309,45 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
             colHeaderGrow("ch-path", "PATH");
         });
 
-        // Scrollable row area
+        // Scrollable row area (virtualized — only visible rows are built)
+        const scroll_offset = clay.getScrollOffset();
+        const scroll_y: f32 = -scroll_offset.y; // positive = scrolled down
+        const viewport_h = interaction.viewport_height;
+        const total_rows: usize = row_texts.len;
+        const total_content_h = @as(f32, @floatFromInt(total_rows)) * theme.row_height;
+
+        // Visible row range with buffer
+        const first_visible: usize = if (scroll_y > 0)
+            @min(@as(usize, @intFromFloat(scroll_y / theme.row_height)), total_rows)
+        else
+            0;
+        const visible_count: usize = @as(usize, @intFromFloat(viewport_h / theme.row_height)) + 4; // 2 row buffer each side
+        const first_row = if (first_visible >= 2) first_visible - 2 else 0;
+        const last_row = @min(first_row + visible_count, total_rows);
+
+        // Top spacer (height of all rows above the visible window)
+        const top_spacer_h = @as(f32, @floatFromInt(first_row)) * theme.row_height;
+        // Bottom spacer (height of all rows below the visible window)
+        const bottom_spacer_h = @as(f32, @floatFromInt(total_rows - last_row)) * theme.row_height;
+
         clay.UI()(.{
             .id = clay.ElementId.ID("scroll"),
             .layout = .{
                 .sizing = clay.Sizing.grow,
                 .direction = .top_to_bottom,
             },
-            .clip = .{ .vertical = true, .child_offset = clay.getScrollOffset() },
+            .clip = .{ .vertical = true, .child_offset = scroll_offset },
         })({
-            for (row_texts, 0..) |row, i| {
+            // Top spacer — represents rows above the visible window
+            if (top_spacer_h > 0) {
+                clay.UI()(.{
+                    .id = clay.ElementId.ID("v-top"),
+                    .layout = .{ .sizing = .{ .w = clay.SizingAxis.grow, .h = clay.SizingAxis.fixed(top_spacer_h) } },
+                })({});
+            }
+
+            // Only build Clay elements for visible rows
+            for (row_texts[first_row..last_row], first_row..last_row) |row, i| {
                 const is_selected = if (i < interaction.is_selected.len) interaction.is_selected[i] else false;
                 const is_hovered = if (interaction.hovered_index) |hi| hi == i else false;
                 const bg_color = if (is_selected) theme.row_selected
@@ -337,7 +367,6 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
                 })({
                     cell("pid", i, interaction.col_widths[0], row.pid_str, theme.text_dim);
                     nameCellDyn(i, row, interaction.col_widths[1]);
-                    // Intensity coloring: reduced (0.3x) when selected so selection is still visible
                     const i_scale: f32 = if (is_selected) 0.3 else 1.0;
                     intensityCell("cpu", i, interaction.col_widths[2], row.cpu_str, theme.text_dim, theme.intensity_tint, row.cpu_intensity * i_scale, bg_color);
                     intensityCell("mem", i, interaction.col_widths[3], row.mem_str, theme.text_dim, theme.intensity_tint, row.mem_intensity * i_scale, bg_color);
@@ -346,6 +375,15 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
                     pathCell(i, row);
                 });
             }
+
+            // Bottom spacer — represents rows below the visible window
+            if (bottom_spacer_h > 0) {
+                clay.UI()(.{
+                    .id = clay.ElementId.ID("v-bot"),
+                    .layout = .{ .sizing = .{ .w = clay.SizingAxis.grow, .h = clay.SizingAxis.fixed(bottom_spacer_h) } },
+                })({});
+            }
+            _ = total_content_h;
         });
 
         // CPU cores at bottom of processes tab

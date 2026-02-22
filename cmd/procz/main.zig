@@ -115,11 +115,15 @@ const state = struct {
     var last_snapshot_time_ns: i128 = 0;
     var snapshot_interval_ns: u64 = 2 * std.time.ns_per_s; // default 2s
 
-    // Previous snapshot values for graph delta computation
-    const PrevEntry = struct { pid: i32 = 0, cpu: u64 = 0, disk: u64 = 0, gpu: u64 = 0 };
-    const MAX_PREV = 4096;
-    var prev_values: [MAX_PREV]PrevEntry = [_]PrevEntry{.{}} ** MAX_PREV;
-    var prev_count: usize = 0;
+    // Previous snapshot values (HashMap for O(1) lookup)
+    const PrevEntry = struct { cpu: u64 = 0, disk: u64 = 0, gpu: u64 = 0 };
+    var prev_map: std.AutoHashMap(process.pid_t, PrevEntry) = undefined;
+    var prev_map_inited: bool = false;
+
+    // Pre-computed deltas (rebuilt once per snapshot, read every frame)
+    const DeltaEntry = struct { cpu: u64 = 0, disk: u64 = 0, gpu: u64 = 0 };
+    var delta_map: std.AutoHashMap(process.pid_t, DeltaEntry) = undefined;
+    var delta_map_inited: bool = false;
 
     // Per-core CPU utilization
     var prev_core_ticks: [platform.MAX_CORES]platform.CoreTicks = [_]platform.CoreTicks{.{}} ** platform.MAX_CORES;
@@ -260,7 +264,10 @@ fn drainEvents() void {
                 // Clear exited_pids — fresh snapshot is authoritative
                 state.exited_pids.clearRetainingCapacity();
 
-                // Push graph data (needs deltas from prev values, skip first snapshot)
+                // Compute deltas once per snapshot (O(N) with HashMap)
+                if (had_previous) computeDeltas();
+
+                // Push graph data using pre-computed deltas
                 if (had_previous) pushGraphData();
 
                 // Update per-core CPU utilization
@@ -291,20 +298,44 @@ fn drainEvents() void {
 }
 
 fn savePreviousValues() void {
-    var count: usize = 0;
+    if (!state.prev_map_inited) {
+        state.prev_map = std.AutoHashMap(process.pid_t, state.PrevEntry).init(std.heap.page_allocator);
+        state.prev_map_inited = true;
+    }
+    state.prev_map.clearRetainingCapacity();
     var iter = state.proc_map.iterator();
     while (iter.next()) |entry| {
-        if (count >= state.MAX_PREV) break;
         const p = entry.value_ptr.*;
-        state.prev_values[count] = .{
-            .pid = p.pid,
+        state.prev_map.put(p.pid, .{
             .cpu = p.total_user + p.total_system,
             .disk = p.diskio_bytes_read + p.diskio_bytes_written,
             .gpu = p.gpu_time_ns,
-        };
-        count += 1;
+        }) catch continue;
     }
-    state.prev_count = count;
+}
+
+/// Compute deltas once per snapshot. Called from drainEvents after savePreviousValues + map swap.
+fn computeDeltas() void {
+    if (!state.delta_map_inited) {
+        state.delta_map = std.AutoHashMap(process.pid_t, state.DeltaEntry).init(std.heap.page_allocator);
+        state.delta_map_inited = true;
+    }
+    state.delta_map.clearRetainingCapacity();
+    var iter = state.proc_map.iterator();
+    while (iter.next()) |entry| {
+        const p = entry.value_ptr.*;
+        const cpu_total = p.total_user + p.total_system;
+        const disk_total = p.diskio_bytes_read + p.diskio_bytes_written;
+        var cd: u64 = 0;
+        var dd: u64 = 0;
+        var gd: u64 = 0;
+        if (state.prev_map.get(p.pid)) |prev| {
+            cd = cpu_total -| prev.cpu;
+            dd = disk_total -| prev.disk;
+            gd = p.gpu_time_ns -| prev.gpu;
+        }
+        state.delta_map.put(p.pid, .{ .cpu = cd, .disk = dd, .gpu = gd }) catch continue;
+    }
 }
 
 const GraphTopInfo = struct { name: []const u8 = "", value: f32 = 0 };
@@ -320,30 +351,10 @@ fn pushGraphData() void {
     var iter = state.proc_map.iterator();
     while (iter.next()) |entry| {
         const p = entry.value_ptr.*;
-        const cpu_total = p.total_user + p.total_system;
-        var cpu_delta: u64 = 0; // No previous data = unknown rate, treat as 0
-        const disk_total = p.diskio_bytes_read + p.diskio_bytes_written;
-        var disk_delta: u64 = 0;
-
-        for (state.prev_values[0..state.prev_count]) |prev| {
-            if (prev.pid == p.pid) {
-                cpu_delta = cpu_total -| prev.cpu;
-                disk_delta = disk_total -| prev.disk;
-                break;
-            }
-        }
-
-        // DEBUG: print raw values for "yes" processes
-        if (std.mem.eql(u8, p.name, "yes")) {
-            std.debug.print("DBG yes pid={d} cpu_total={d} delta={d} interval={d} pct={d:.1}%\n", .{
-                p.pid, cpu_total, cpu_delta, state.snapshot_interval_ns,
-                if (state.snapshot_interval_ns > 0) @as(f64, @floatFromInt(cpu_delta)) / @as(f64, @floatFromInt(state.snapshot_interval_ns)) * 100.0 else 0.0,
-            });
-        }
-
-        insertTopInfo(&top_cpu, &cpu_count, p.name, @floatFromInt(cpu_delta));
+        const d = state.delta_map.get(p.pid) orelse state.DeltaEntry{};
+        insertTopInfo(&top_cpu, &cpu_count, p.name, @floatFromInt(d.cpu));
         insertTopInfo(&top_mem, &mem_count, p.name, @floatFromInt(p.mem_rss));
-        insertTopInfo(&top_disk, &disk_count, p.name, @floatFromInt(disk_delta));
+        insertTopInfo(&top_disk, &disk_count, p.name, @floatFromInt(d.disk));
     }
 
     // Push to graph histories
@@ -506,6 +517,7 @@ export fn frame() void {
         .search_focused = state.search_focused,
         .cursor_visible = state.cursor_blink_timer < 0.5,
         .active_tab = state.active_tab,
+        .viewport_height = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - 28 - 32,
     }, .{
         .settings_open = state.settings_open,
     });
@@ -587,21 +599,9 @@ fn formatRowTexts(alloc: std.mem.Allocator) ![]layout.RowText {
         if (state.exited_pids.contains(pid)) continue;
         const p = state.proc_map.get(pid) orelse continue;
 
-        // Compute deltas from previous snapshot for this process
-        const cpu_total = p.total_user + p.total_system;
-        const disk_total = p.diskio_bytes_read + p.diskio_bytes_written;
-        var cd: u64 = 0;
-        var dd: u64 = 0;
-        var gd: u64 = 0;
-        for (state.prev_values[0..state.prev_count]) |prev| {
-            if (prev.pid == pid) {
-                cd = cpu_total -| prev.cpu;
-                dd = disk_total -| prev.disk;
-                gd = p.gpu_time_ns -| prev.gpu;
-                break;
-            }
-        }
-        filtered.appendAssumeCapacity(.{ .pid = pid, .proc_data = p, .depth = row.depth, .cpu_delta = cd, .disk_delta = dd, .gpu_delta = gd });
+        // Use pre-computed deltas (O(1) HashMap lookup)
+        const d = state.delta_map.get(pid) orelse state.DeltaEntry{};
+        filtered.appendAssumeCapacity(.{ .pid = pid, .proc_data = p, .depth = row.depth, .cpu_delta = d.cpu, .disk_delta = d.disk, .gpu_delta = d.gpu });
     }
 
     // Search filter

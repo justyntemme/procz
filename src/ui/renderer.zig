@@ -3,6 +3,7 @@ const sokol = @import("sokol");
 const clay = @import("zclay");
 const theme = @import("theme");
 const font = @import("font");
+const graph = @import("graph");
 
 const slog = sokol.log;
 const sg = sokol.gfx;
@@ -91,6 +92,9 @@ pub fn render(commands: []const clay.RenderCommand) void {
             else => {},
         }
     }
+
+    // Render graph line overlays on top of Clay elements
+    graph.renderAll();
 
     // Log sgl errors (rate-limited)
     const err = sgl.getError();

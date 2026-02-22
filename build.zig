@@ -95,6 +95,14 @@ pub fn build(b: *std.Build) void {
     font_mod.linkLibrary(stbtt_lib);
     font_mod.addIncludePath(b.path("lib"));
 
+    const graph_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui/graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graph_mod.addImport("sokol", sokol_mod);
+    graph_mod.addImport("theme", theme_mod);
+
     const renderer_mod = b.createModule(.{
         .root_source_file = b.path("src/ui/renderer.zig"),
         .target = target,
@@ -104,6 +112,7 @@ pub fn build(b: *std.Build) void {
     renderer_mod.addImport("zclay", zclay_mod);
     renderer_mod.addImport("theme", theme_mod);
     renderer_mod.addImport("font", font_mod);
+    renderer_mod.addImport("graph", graph_mod);
 
     const layout_mod = b.createModule(.{
         .root_source_file = b.path("src/ui/layout.zig"),
@@ -114,9 +123,9 @@ pub fn build(b: *std.Build) void {
     layout_mod.addImport("process", process_mod);
     layout_mod.addImport("theme", theme_mod);
 
-    // -- main module --
+    // -- procz main module --
     const main_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("cmd/procz/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -131,18 +140,94 @@ pub fn build(b: *std.Build) void {
     main_mod.addImport("channel", channel_mod);
     main_mod.addImport("producer", producer_mod);
     main_mod.addImport("font", font_mod);
+    main_mod.addImport("graph", graph_mod);
 
-    // -- executable --
+    // -- procz-detail module --
+    const detail_mod = b.createModule(.{
+        .root_source_file = b.path("cmd/procDetail/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    detail_mod.addImport("sokol", sokol_mod);
+    detail_mod.addImport("zclay", zclay_mod);
+    detail_mod.addImport("process", process_mod);
+    detail_mod.addImport("platform", platform_mod);
+    detail_mod.addImport("theme", theme_mod);
+    detail_mod.addImport("renderer", renderer_mod);
+    detail_mod.addImport("font", font_mod);
+    detail_mod.addImport("graph", graph_mod);
+
+    // -- macOS native menu (Objective-C) and GPU monitor (C/IOKit) --
+    if (target.result.os.tag == .macos) {
+        const menu_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        const menu_lib = b.addLibrary(.{
+            .name = "native_menu",
+            .linkage = .static,
+            .root_module = menu_mod,
+        });
+        menu_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_menu.m"),
+            .flags = &.{"-fobjc-arc"},
+        });
+        menu_mod.addIncludePath(b.path("src/platform"));
+        menu_mod.link_libc = true;
+
+        // GPU usage collector via IOKit
+        const gpu_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        const gpu_lib = b.addLibrary(.{
+            .name = "gpu_monitor",
+            .linkage = .static,
+            .root_module = gpu_mod,
+        });
+        gpu_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_gpu.c"),
+            .flags = &.{},
+        });
+        gpu_mod.addIncludePath(b.path("src/platform"));
+        gpu_mod.link_libc = true;
+
+        // Link native menu into both binaries
+        main_mod.linkLibrary(menu_lib);
+        main_mod.addIncludePath(b.path("src/platform"));
+
+        detail_mod.linkLibrary(menu_lib);
+        detail_mod.addIncludePath(b.path("src/platform"));
+
+        // Link GPU lib into platform module so macos.zig can @cImport the header
+        platform_mod.linkLibrary(gpu_lib);
+        platform_mod.addIncludePath(b.path("src/platform"));
+    }
+
+    // -- procz executable --
     const exe = b.addExecutable(.{
         .name = "procz",
         .root_module = main_mod,
     });
 
+    // -- procz-detail executable --
+    const detail_exe = b.addExecutable(.{
+        .name = "procz-detail",
+        .root_module = detail_mod,
+    });
+
     if (target.result.os.tag == .macos) {
         exe.linkSystemLibrary("proc");
+        exe.linkFramework("IOKit");
+        exe.linkFramework("CoreFoundation");
+
+        detail_exe.linkSystemLibrary("proc");
+        detail_exe.linkFramework("IOKit");
+        detail_exe.linkFramework("CoreFoundation");
     }
 
     b.installArtifact(exe);
+    b.installArtifact(detail_exe);
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
@@ -150,6 +235,14 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run procz");
     run_step.dependOn(&run_cmd.step);
+
+    // Run procz-detail directly (usage: zig build run-detail -- <pid>)
+    const detail_run_cmd = b.addRunArtifact(detail_exe);
+    if (b.args) |args| {
+        for (args) |arg| detail_run_cmd.addArg(arg);
+    }
+    const detail_run_step = b.step("run-detail", "Run procz-detail (pass PID as arg)");
+    detail_run_step.dependOn(&detail_run_cmd.step);
 
     // macOS code signing with entitlements (separate step, requires sudo)
     // Usage: zig build sign-run -Didentity="<SHA-1 hash or identity name>"
@@ -162,6 +255,7 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .macos) {
         if (signing_identity) |identity| {
+            // Sign procz
             const codesign = b.addSystemCommand(&.{
                 "sudo",
                 "codesign",
@@ -175,12 +269,28 @@ pub fn build(b: *std.Build) void {
             codesign.addArg(identity);
             codesign.addArtifactArg(exe);
 
-            const sign_step = b.step("sign", "Build and sign with entitlements (requires sudo)");
-            sign_step.dependOn(&codesign.step);
+            // Sign procz-detail
+            const codesign_detail = b.addSystemCommand(&.{
+                "sudo",
+                "codesign",
+                "--force",
+                "--options",
+                "runtime",
+                "--entitlements",
+            });
+            codesign_detail.addFileArg(b.path("procz.entitlements"));
+            codesign_detail.addArg("--sign");
+            codesign_detail.addArg(identity);
+            codesign_detail.addArtifactArg(detail_exe);
 
-            // sign-run: build, sign, then run
+            const sign_step = b.step("sign", "Build and sign both binaries with entitlements (requires sudo)");
+            sign_step.dependOn(&codesign.step);
+            sign_step.dependOn(&codesign_detail.step);
+
+            // sign-run: build, sign, then run procz
             const signed_run = b.addRunArtifact(exe);
             signed_run.step.dependOn(&codesign.step);
+            signed_run.step.dependOn(&codesign_detail.step);
             const sign_run_step = b.step("sign-run", "Build, sign, and run (requires sudo)");
             sign_run_step.dependOn(&signed_run.step);
         }

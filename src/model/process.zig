@@ -22,5 +22,8 @@ pub const Proc = struct {
     mem_phys: u64 = 0,
     total_user: u64 = 0,
     total_system: u64 = 0,
+    diskio_bytes_read: u64 = 0,
+    diskio_bytes_written: u64 = 0,
+    gpu_time_ns: u64 = 0,
     start_time_ns: i128 = 0,
 };

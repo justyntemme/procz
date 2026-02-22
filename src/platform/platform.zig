@@ -13,12 +13,25 @@ const impl = switch (builtin.os.tag) {
 };
 
 pub const ExitWatcher = impl.ExitWatcher;
+pub const MAX_CORES = impl.MAX_CORES;
+pub const CoreTicks = impl.CoreTicks;
+
+/// Return per-core CPU tick counts (user, system, idle, nice).
+/// Writes into `out` and returns the number of cores found.
+pub fn getPerCoreCpuTicks(out: *[MAX_CORES]CoreTicks) usize {
+    return impl.getPerCoreCpuTicks(out);
+}
 
 /// Middle-truncate a filesystem path, preserving root context and binary name.
 /// - macOS: Pure Zig. NSLineBreakByTruncatingMiddle is a rendering enum, not a string API.
 /// - Windows (future): TODO use PathCompactPathEx from shlwapi.h.
 pub fn middleTruncatePath(path: []const u8, max_chars: usize, alloc: std.mem.Allocator) []const u8 {
     return impl.middleTruncatePath(path, max_chars, alloc);
+}
+
+/// Return total physical RAM in bytes.
+pub fn getTotalMemory() u64 {
+    return impl.getTotalMemory();
 }
 
 pub const PlatformError = error{
@@ -30,4 +43,10 @@ pub const PlatformError = error{
 /// Returns a map of pid -> Proc.
 pub fn collectSnapshot(arena: std.mem.Allocator) PlatformError!std.AutoHashMap(pid_t, Proc) {
     return impl.collectSnapshot(arena);
+}
+
+/// Collect data for a single process by PID. All strings owned by `arena`.
+/// Returns null if the process doesn't exist or isn't accessible.
+pub fn collectProcess(arena: std.mem.Allocator, pid: pid_t) ?Proc {
+    return impl.collectProcess(arena, pid);
 }

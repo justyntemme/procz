@@ -97,13 +97,22 @@ pub const InteractionState = struct {
     search_text: []const u8 = "",
     search_focused: bool = false,
     cursor_visible: bool = true,
+    cursor_pos: usize = 0,
+    selection_start: ?usize = null, // anchor for text selection (null = no selection)
     active_tab: ActiveTab = .processes,
+    tab_anim: f32 = 0.0, // tab indicator cross-fade (0=processes, 1=performance)
+    search_width_anim: f32 = 200.0, // animated search bar width
+    sort_anim: f32 = 0.0, // sort indicator opacity (0→1)
+    hover_anim: f32 = 0.0, // hover row highlight blend (0→1)
+    hover_anim_index: ?usize = null, // row with active hover animation
+    row_flash: []const f32 = &.{}, // parallel to row_texts — new-process flash intensity
     viewport_height: f32 = 600,
     scroll_y: f32 = 0, // pre-fetched scroll offset for processes tab virtualization
 };
 
 pub const MenuState = struct {
     settings_open: bool = false,
+    settings_anim: f32 = 0.0, // popup fade (0=hidden, 1=visible)
 };
 
 
@@ -124,7 +133,7 @@ pub fn buildLayout(row_texts: []const RowText, summary: SystemSummary, interacti
         .background_color = theme.bg,
     })({
         buildHeader(summary, menu, interaction);
-        buildTabBar(interaction.active_tab);
+        buildTabBar(interaction);
 
         // Tab content area
         switch (interaction.active_tab) {
@@ -134,9 +143,9 @@ pub fn buildLayout(row_texts: []const RowText, summary: SystemSummary, interacti
 
         buildFooter();
 
-        // Settings popup (floating, high z-index)
-        if (menu.settings_open) {
-            buildSettingsPopup();
+        // Settings popup (floating, high z-index, animated)
+        if (menu.settings_anim > 0.01) {
+            buildSettingsPopup(menu.settings_anim);
         }
     });
 
@@ -186,7 +195,7 @@ fn buildSearchBar(interaction: InteractionState) void {
     // - Widens on focus for more typing room
     const focused = interaction.search_focused;
     const has_text = interaction.search_text.len > 0;
-    const field_w: f32 = if (focused or has_text) 260 else 200;
+    const field_w: f32 = interaction.search_width_anim;
     const field_h: f32 = 28;
     const pill_radius = field_h / 2.0;
 
@@ -232,25 +241,54 @@ fn buildSearchBar(interaction: InteractionState) void {
             // Placeholder: "Filter" in placeholderText color
             clay.text("Filter", .{ .color = theme.text_footer, .font_size = 14 });
         } else if (!has_text and focused) {
-            // Focused but empty: show subtle prompt + tight cursor
+            // Focused but empty: blinking cursor at left edge
             clay.UI()(.{
                 .id = clay.ElementId.ID("search-inner"),
                 .layout = .{ .direction = .left_to_right, .child_gap = 0 },
             })({
-                clay.text("Filter processes\xe2\x80\xa6", .{ .color = theme.text_footer, .font_size = 14 });
                 if (interaction.cursor_visible) {
                     clay.text("|", .{ .color = theme.accent, .font_size = 14 });
                 }
             });
         } else {
-            // Has text: show typed content + tight cursor
+            // Has text: show typed content with cursor/selection
+            const pos = @min(interaction.cursor_pos, interaction.search_text.len);
+            const has_sel = if (interaction.selection_start) |ss| @min(ss, interaction.search_text.len) != pos else false;
+
             clay.UI()(.{
                 .id = clay.ElementId.ID("search-txt"),
                 .layout = .{ .direction = .left_to_right, .child_gap = 0 },
             })({
-                clay.text(interaction.search_text, .{ .color = theme.text_primary, .font_size = 14 });
-                if (focused and interaction.cursor_visible) {
-                    clay.text("|", .{ .color = theme.accent, .font_size = 14 });
+                if (has_sel) {
+                    const ss = @min(interaction.selection_start.?, interaction.search_text.len);
+                    const sel_lo = @min(ss, pos);
+                    const sel_hi = @max(ss, pos);
+                    if (sel_lo > 0) {
+                        clay.text(interaction.search_text[0..sel_lo], .{ .color = theme.text_primary, .font_size = 14 });
+                    }
+                    // Selection highlight
+                    clay.UI()(.{
+                        .id = clay.ElementId.ID("search-sel"),
+                        .layout = .{ .child_gap = 0 },
+                        .background_color = .{ theme.accent[0], theme.accent[1], theme.accent[2], 100 },
+                        .corner_radius = clay.CornerRadius.all(2),
+                    })({
+                        clay.text(interaction.search_text[sel_lo..sel_hi], .{ .color = theme.text_primary, .font_size = 14 });
+                    });
+                    if (sel_hi < interaction.search_text.len) {
+                        clay.text(interaction.search_text[sel_hi..], .{ .color = theme.text_primary, .font_size = 14 });
+                    }
+                } else {
+                    // No selection — show cursor pipe at position
+                    if (pos > 0) {
+                        clay.text(interaction.search_text[0..pos], .{ .color = theme.text_primary, .font_size = 14 });
+                    }
+                    if (focused and interaction.cursor_visible) {
+                        clay.text("|", .{ .color = theme.accent, .font_size = 14 });
+                    }
+                    if (pos < interaction.search_text.len) {
+                        clay.text(interaction.search_text[pos..], .{ .color = theme.text_primary, .font_size = 14 });
+                    }
                 }
             });
         }
@@ -261,7 +299,7 @@ fn buildSearchBar(interaction: InteractionState) void {
 // Tab bar — horizontal row above content (classic Task Manager style)
 // ---------------------------------------------------------------------------
 
-fn buildTabBar(active: ActiveTab) void {
+fn buildTabBar(interaction: InteractionState) void {
     clay.UI()(.{
         .id = clay.ElementId.ID("tab-bar"),
         .layout = .{
@@ -272,12 +310,12 @@ fn buildTabBar(active: ActiveTab) void {
         },
         .background_color = theme.tab_bg,
     })({
-        buildTabItem("tab-processes", "Processes", active == .processes);
-        buildTabItem("tab-perf", "Performance", active == .performance);
+        buildTabItem("tab-processes", "Processes", interaction.active_tab == .processes, 1.0 - interaction.tab_anim);
+        buildTabItem("tab-perf", "Performance", interaction.active_tab == .performance, interaction.tab_anim);
     });
 }
 
-fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool) void {
+fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool, indicator_alpha: f32) void {
     const is_hovered = !is_active and clay.pointerOver(clay.ElementId.ID(id));
     const item_bg = if (is_active) theme.bg
         else if (is_hovered) theme.row_hover
@@ -303,14 +341,14 @@ fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool) voi
             .layout = .{ .sizing = .{ .h = clay.SizingAxis.grow } },
         })({});
 
-        // Active indicator: 2px accent bar at bottom edge
-        if (is_active) {
+        // Active indicator: 2px accent bar at bottom edge (cross-fade animated)
+        if (indicator_alpha > 0.01) {
             clay.UI()(.{
                 .id = clay.ElementId.ID(id ++ "-ind"),
                 .layout = .{
                     .sizing = .{ .w = clay.SizingAxis.grow, .h = clay.SizingAxis.fixed(2) },
                 },
-                .background_color = theme.accent,
+                .background_color = .{ theme.accent[0], theme.accent[1], theme.accent[2], theme.accent[3] * indicator_alpha },
                 .corner_radius = clay.CornerRadius.all(1),
             })({});
         }
@@ -422,10 +460,10 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
             for (row_texts[first_row..last_row], first_row..last_row) |row, i| {
                 const is_selected = if (i < interaction.is_selected.len) interaction.is_selected[i] else false;
                 const is_hovered = if (interaction.hovered_index) |hi| hi == i else false;
-                const bg_color = if (is_selected) theme.row_selected
-                    else if (is_hovered) theme.row_hover
-                    else if (i % 2 == 0) theme.row_even
-                    else theme.row_odd;
+                const base_bg = if (is_selected) theme.row_selected else if (i % 2 == 0) theme.row_even else theme.row_odd;
+                const with_hover = if (!is_selected and is_hovered) blendColor(base_bg, theme.row_hover, interaction.hover_anim) else base_bg;
+                const flash_t: f32 = if (i < interaction.row_flash.len) interaction.row_flash[i] else 0;
+                const bg_color = if (flash_t > 0.01) blendColor(with_hover, .{ theme.accent[0], theme.accent[1], theme.accent[2], 255 }, flash_t * 0.25) else with_hover;
 
                 clay.UI()(.{
                     .id = clay.ElementId.IDI("row", @intCast(i)),
@@ -638,8 +676,8 @@ fn buildFooter() void {
 // Settings popup (floating modal)
 // ---------------------------------------------------------------------------
 
-fn buildSettingsPopup() void {
-    // Scrim — full-screen dimming overlay behind the modal
+fn buildSettingsPopup(anim: f32) void {
+    // Scrim — full-screen dimming overlay behind the modal (fade-in animated)
     clay.UI()(.{
         .id = clay.ElementId.ID("scrim"),
         .floating = .{
@@ -650,11 +688,11 @@ fn buildSettingsPopup() void {
         .layout = .{
             .sizing = clay.Sizing.grow,
         },
-        .background_color = .{ 0, 0, 0, 120 },
+        .background_color = .{ 0, 0, 0, 120.0 * anim },
     })({});
 
-    // Multi-layer soft shadow behind the modal (4 layers: outermost → innermost)
-    const shadow_layers = [_]struct { ox: f32, oy: f32, expand: f32, alpha: u8 }{
+    // Multi-layer soft shadow behind the modal (4 layers: outermost → innermost, fade-in animated)
+    const shadow_layers = [_]struct { ox: f32, oy: f32, expand: f32, alpha: f32 }{
         .{ .ox = 6, .oy = 8, .expand = 12, .alpha = 15 },
         .{ .ox = 4, .oy = 6, .expand = 8, .alpha = 30 },
         .{ .ox = 2, .oy = 4, .expand = 4, .alpha = 50 },
@@ -666,23 +704,24 @@ fn buildSettingsPopup() void {
             .floating = .{
                 .attach_to = .to_root,
                 .attach_points = .{ .element = .center_center, .parent = .center_center },
-                .offset = .{ .x = sl.ox, .y = sl.oy },
+                .offset = .{ .x = sl.ox, .y = sl.oy + (1.0 - anim) * 10.0 },
                 .z_index = 191 + i,
             },
             .layout = .{
                 .sizing = .{ .w = clay.SizingAxis.fixed(360 + sl.expand), .h = clay.SizingAxis.fixed(440 + sl.expand) },
             },
-            .background_color = .{ theme.shadow_color[0], theme.shadow_color[1], theme.shadow_color[2], sl.alpha },
+            .background_color = .{ theme.shadow_color[0], theme.shadow_color[1], theme.shadow_color[2], sl.alpha * anim },
             .corner_radius = clay.CornerRadius.all(theme.corner_radius_lg + 2 + sl.expand / 2),
         })({});
     }
 
-    // Centered floating panel
+    // Centered floating panel (slides up as it fades in)
     clay.UI()(.{
         .id = clay.ElementId.ID("settings-pnl"),
         .floating = .{
             .attach_to = .to_root,
             .attach_points = .{ .element = .center_center, .parent = .center_center },
+            .offset = .{ .x = 0, .y = (1.0 - anim) * 10.0 },
             .z_index = 200,
         },
         .layout = .{
@@ -691,10 +730,10 @@ fn buildSettingsPopup() void {
             .padding = clay.Padding.all(24),
             .child_gap = 14,
         },
-        .background_color = theme.menu_bg,
+        .background_color = .{ theme.menu_bg[0], theme.menu_bg[1], theme.menu_bg[2], theme.menu_bg[3] * anim },
         .corner_radius = clay.CornerRadius.all(theme.corner_radius_lg),
         .border = .{
-            .color = .{ theme.menu_border[0], theme.menu_border[1], theme.menu_border[2], 80 },
+            .color = .{ theme.menu_border[0], theme.menu_border[1], theme.menu_border[2], 80.0 * anim },
             .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
         },
     })({
@@ -834,9 +873,10 @@ fn colHeaderCellAlpha(comptime id: []const u8, width: f32, label: []const u8, co
     })({
         clay.text(label, .{ .color = text_color, .font_size = 16 });
         if (is_sorted) {
-            // ▲ U+25B2 = \xe2\x96\xb2, ▼ U+25BC = \xe2\x96\xbc
+            // ▲ U+25B2 = \xe2\x96\xb2, ▼ U+25BC = \xe2\x96\xbc (fade-in animated)
+            const sort_alpha = alpha * interaction.sort_anim;
             const indicator: []const u8 = if (interaction.sort_direction == .ascending) "\xe2\x96\xb2" else "\xe2\x96\xbc";
-            clay.text(indicator, .{ .color = text_color, .font_size = 14 });
+            clay.text(indicator, .{ .color = .{ theme.text_header[0], theme.text_header[1], theme.text_header[2], sort_alpha }, .font_size = 14 });
         }
         // Spacer pushes resize handle to right edge
         clay.UI()(.{
@@ -905,6 +945,15 @@ fn nameCellDyn(index: usize, row: RowText, width: f32) void {
         }
         clay.text(row.name, .{ .color = theme.text_primary, .font_size = 16 });
     });
+}
+
+fn blendColor(a: clay.Color, b: clay.Color, t: f32) clay.Color {
+    return .{
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    };
 }
 
 fn pathCell(index: usize, row: RowText) void {

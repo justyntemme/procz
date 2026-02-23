@@ -96,7 +96,8 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
     }
 
     // Search filter
-    if (params.search_text.len > 0) {
+    const has_search = params.search_text.len > 0;
+    if (has_search) {
         var w: usize = 0;
         for (filtered.items) |entry| {
             if (caseInsensitiveContains(entry.proc_data.name, params.search_text) or
@@ -109,11 +110,14 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
         filtered.shrinkRetainingCapacity(w);
     }
 
-    // Sort if active
+    // Sort: explicit column sort takes priority; otherwise rank by search relevance
     const is_sorted = params.sort_column != .none;
     if (is_sorted) {
         const sort_ctx = SortContext{ .column = params.sort_column, .direction = params.sort_direction };
         std.mem.sortUnstable(TreeEntry, filtered.items, sort_ctx, sortCompare);
+    } else if (has_search) {
+        const search_ctx = SearchSortContext{ .needle = params.search_text };
+        std.mem.sortUnstable(TreeEntry, filtered.items, search_ctx, searchSortCompare);
     }
     const items = filtered.items;
 
@@ -314,6 +318,45 @@ fn sortCompare(ctx: SortContext, a: TreeEntry, b: TreeEntry) bool {
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
+
+const SearchSortContext = struct {
+    needle: []const u8,
+};
+
+/// Relevance score for search ranking (higher = better match).
+/// 4 = exact name match, 3 = name starts with, 2 = name contains, 1 = path-only match.
+fn searchRelevance(name: []const u8, path: []const u8, needle: []const u8) u8 {
+    if (caseInsensitiveEqual(name, needle)) return 4;
+    if (caseInsensitiveStartsWith(name, needle)) return 3;
+    if (caseInsensitiveContains(name, needle)) return 2;
+    if (caseInsensitiveContains(path, needle)) return 1;
+    return 0;
+}
+
+fn searchSortCompare(ctx: SearchSortContext, a: TreeEntry, b: TreeEntry) bool {
+    const ra = searchRelevance(a.proc_data.name, a.proc_data.path, ctx.needle);
+    const rb = searchRelevance(b.proc_data.name, b.proc_data.path, ctx.needle);
+    if (ra != rb) return ra > rb; // higher relevance first
+    // Tie-break: shorter name first (more specific match)
+    if (a.proc_data.name.len != b.proc_data.name.len) return a.proc_data.name.len < b.proc_data.name.len;
+    return false; // stable
+}
+
+fn caseInsensitiveEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ac, bc| {
+        if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
+    }
+    return true;
+}
+
+fn caseInsensitiveStartsWith(haystack: []const u8, prefix: []const u8) bool {
+    if (haystack.len < prefix.len) return false;
+    for (haystack[0..prefix.len], prefix) |hc, pc| {
+        if (std.ascii.toLower(hc) != std.ascii.toLower(pc)) return false;
+    }
+    return true;
+}
 
 fn caseInsensitiveContains(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;

@@ -38,6 +38,9 @@ pub const GraphHistory = struct {
     name_lens: [MAX_TRACKED]u8 = [_]u8{0} ** MAX_TRACKED,
     current_count: u8 = 0,
 
+    // Lerped display values for smooth animation of the latest data point
+    display_latest: [MAX_TRACKED]f32 = [_]f32{0} ** MAX_TRACKED,
+
     pub fn push(self: *GraphHistory, values: []const f32, names: []const []const u8) void {
         const count: u8 = @intCast(@min(values.len, MAX_TRACKED));
 
@@ -58,6 +61,16 @@ pub const GraphHistory = struct {
             @memcpy(self.names[i][0..len], name[0..len]);
             if (len < 32) self.names[i][len] = 0;
             self.name_lens[i] = @intCast(len);
+        }
+    }
+
+    pub fn lerpDisplay(self: *GraphHistory) void {
+        if (self.len == 0) return;
+        const latest = (self.head + MAX_HISTORY - 1) % MAX_HISTORY;
+        const dp = self.points[latest];
+        const dp_count: usize = @intCast(dp.count);
+        for (0..dp_count) |i| {
+            self.display_latest[i] += (dp.values[i] - self.display_latest[i]) * 0.15;
         }
     }
 
@@ -95,6 +108,17 @@ var spark_head: usize = 0;
 var spark_len: usize = 0;
 pub var spark_core_count: usize = 0;
 pub var spark_bounds: ?Bounds = null;
+
+/// Lerped display values for smooth sparkline transitions
+pub var display_utils: [MAX_SPARK_CORES]f32 = [_]f32{0} ** MAX_SPARK_CORES;
+
+pub fn lerpCoreDisplay() void {
+    if (spark_len == 0) return;
+    const latest = (spark_head + SPARK_HISTORY - 1) % SPARK_HISTORY;
+    for (0..spark_core_count) |c| {
+        display_utils[c] += (core_data[c][latest] - display_utils[c]) * 0.15;
+    }
+}
 
 pub fn pushCoreData(utils: []const f32) void {
     const count = @min(utils.len, MAX_SPARK_CORES);
@@ -138,11 +162,22 @@ pub fn renderAll() void {
 // Graph rendering
 // ---------------------------------------------------------------------------
 
-fn renderGraph(history: *const GraphHistory, bounds: Bounds) void {
+fn renderGraph(history: *GraphHistory, bounds: Bounds) void {
     if (history.len < 2) return;
 
     const count: usize = history.current_count;
     if (count == 0) return;
+
+    // Swap latest point with lerped display values for smooth animation
+    const latest = (history.head + MAX_HISTORY - 1) % MAX_HISTORY;
+    var saved: [MAX_TRACKED]f32 = undefined;
+    for (0..count) |j| {
+        saved[j] = history.points[latest].values[j];
+        history.points[latest].values[j] = history.display_latest[j];
+    }
+    defer for (0..count) |j| {
+        history.points[latest].values[j] = saved[j];
+    };
 
     // Auto-scale: find max value across all visible points
     var max_val: f32 = 0.001; // avoid division by zero
@@ -301,7 +336,12 @@ fn renderSparklines(bounds: Bounds) void {
         sgl.v2f(sx, sy + spark_h);
         sgl.end();
 
+        // Swap latest point with lerped display value for smooth animation
+        const latest_idx = (spark_head + SPARK_HISTORY - 1) % SPARK_HISTORY;
+        const saved_val = core_data[ci][latest_idx];
+        core_data[ci][latest_idx] = display_utils[ci];
         renderOneSparkline(ci, sx, sy, spark_w, spark_h, r, g, b);
+        core_data[ci][latest_idx] = saved_val;
     }
 
     // Draw tooltip for hovered core

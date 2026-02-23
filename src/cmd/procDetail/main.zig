@@ -83,8 +83,12 @@ const state = struct {
     var net_header_drag_started: bool = false;
     const header_drag_threshold: f32 = 5.0;
 
+    // Tab animation
+    var tab_anim: f32 = 0.0; // 0=overview, 1=network
+
     // Preserve connections toggle
     var preserve_connections: bool = false;
+    var toggle_anim_t: f32 = 0.0; // 0.0 = off, 1.0 = on, lerped each frame
     var preserved_conns: std.ArrayListUnmanaged(process.TcpConnection) = .empty;
     var preserved_names: std.AutoHashMapUnmanaged(process.pid_t, []const u8) = .empty;
 };
@@ -305,6 +309,27 @@ export fn frame() void {
         state.mouse_clicked = false;
     }
 
+    // Animate toggle: lerp toward target (ease-out)
+    {
+        const target: f32 = if (state.preserve_connections) 1.0 else 0.0;
+        const diff = target - state.toggle_anim_t;
+        if (@abs(diff) < 0.005) {
+            state.toggle_anim_t = target;
+        } else {
+            state.toggle_anim_t += diff * 0.18;
+        }
+    }
+    // Animate tab indicator cross-fade
+    {
+        const target: f32 = if (state.active_tab == .network) 1.0 else 0.0;
+        const diff = target - state.tab_anim;
+        if (@abs(diff) < 0.005) {
+            state.tab_anim = target;
+        } else {
+            state.tab_anim += diff * 0.18;
+        }
+    }
+
     const commands = buildLayout(frame_alloc);
 
     sg.beginPass(.{
@@ -445,12 +470,12 @@ fn buildTabBar() void {
         },
         .background_color = theme.tab_bg,
     })({
-        buildTabItem("tab-overview", "Overview", state.active_tab == .overview);
-        buildTabItem("tab-network", "Network", state.active_tab == .network);
+        buildTabItem("tab-overview", "Overview", state.active_tab == .overview, 1.0 - state.tab_anim);
+        buildTabItem("tab-network", "Network", state.active_tab == .network, state.tab_anim);
     });
 }
 
-fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool) void {
+fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool, indicator_alpha: f32) void {
     const is_hovered = !is_active and clay.pointerOver(clay.ElementId.ID(id));
     const item_bg = if (is_active) theme.bg
         else if (is_hovered) theme.row_hover
@@ -476,13 +501,13 @@ fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool) voi
             .layout = .{ .sizing = .{ .h = clay.SizingAxis.grow } },
         })({});
 
-        if (is_active) {
+        if (indicator_alpha > 0.01) {
             clay.UI()(.{
                 .id = clay.ElementId.ID(id ++ "-ind"),
                 .layout = .{
                     .sizing = .{ .w = clay.SizingAxis.grow, .h = clay.SizingAxis.fixed(2) },
                 },
-                .background_color = theme.accent,
+                .background_color = .{ theme.accent[0], theme.accent[1], theme.accent[2], theme.accent[3] * indicator_alpha },
                 .corner_radius = clay.CornerRadius.all(1),
             })({});
         }
@@ -836,47 +861,69 @@ fn buildNetToolbar(alloc: std.mem.Allocator) void {
         clay.text("Preserve", .{ .color = theme.text_dim, .font_size = 12 });
 
         // Mac-style toggle switch
-        buildToggle("toggle-preserve", state.preserve_connections);
+        buildToggle("toggle-preserve", state.toggle_anim_t);
     });
 }
 
-/// Mac-style toggle switch: 44x24 pill, 20x20 knob.
-/// Uses left-to-right layout with spacers to position the knob (no nested floats).
-fn buildToggle(comptime id: []const u8, on: bool) void {
+/// Mac-style toggle switch: 44x24 pill, 20x20 knob with smooth animation.
+/// `t` is the animation progress (0.0 = off, 1.0 = on).
+fn buildToggle(comptime id: []const u8, t: f32) void {
     const track_w: f32 = 44;
     const track_h: f32 = 24;
     const knob_size: f32 = 20;
-    const track_bg = if (on) theme.accent else theme.bar_bg;
-    const border_w: u16 = if (on) 0 else 1;
-    const border_color = if (on) theme.transparent else theme.separator;
 
-    // Padding positions the knob: OFF = 2px from left, ON = 22px from left
-    const pad_left: u16 = if (on) 22 else 2;
-    const pad_right: u16 = if (on) 2 else 22;
+    // Interpolate knob position: 2px (off) → 22px (on)
+    const pad_left: u16 = @intFromFloat(2.0 + t * 20.0);
+    const pad_right: u16 = 44 - 20 - pad_left; // track - knob - left = remaining right
 
+    // Interpolate track color: bar_bg → accent
+    const track_bg = clay.Color{
+        lerpF(theme.bar_bg[0], theme.accent[0], t),
+        lerpF(theme.bar_bg[1], theme.accent[1], t),
+        lerpF(theme.bar_bg[2], theme.accent[2], t),
+        255,
+    };
+
+    // Outer ring fades out as toggle turns on (simulates rounded border)
+    const ring_alpha: f32 = (1.0 - t) * 255.0;
+    const ring_color = clay.Color{ theme.separator[0], theme.separator[1], theme.separator[2], ring_alpha };
+
+    // Outer pill (acts as rounded border ring)
     clay.UI()(.{
         .id = clay.ElementId.ID(id),
         .layout = .{
             .sizing = .{ .w = clay.SizingAxis.fixed(track_w), .h = clay.SizingAxis.fixed(track_h) },
-            .padding = .{ .left = pad_left, .right = pad_right, .top = 2, .bottom = 2 },
+            .padding = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
+            .child_alignment = .{ .x = .center, .y = .center },
         },
-        .background_color = track_bg,
+        .background_color = ring_color,
         .corner_radius = clay.CornerRadius.all(track_h / 2.0),
-        .border = .{
-            .color = border_color,
-            .width = .{ .left = border_w, .right = border_w, .top = border_w, .bottom = border_w },
-        },
     })({
-        // Knob — normal child, positioned by parent padding
+        // Inner track
         clay.UI()(.{
-            .id = clay.ElementId.ID(id ++ "-knob"),
+            .id = clay.ElementId.ID(id ++ "-trk"),
             .layout = .{
-                .sizing = .{ .w = clay.SizingAxis.fixed(knob_size), .h = clay.SizingAxis.fixed(knob_size) },
+                .sizing = .{ .w = clay.SizingAxis.fixed(track_w - 2), .h = clay.SizingAxis.fixed(track_h - 2) },
+                .padding = .{ .left = pad_left, .right = pad_right, .top = 1, .bottom = 1 },
             },
-            .background_color = .{ 255, 255, 255, 255 },
-            .corner_radius = clay.CornerRadius.all(knob_size / 2.0),
-        })({});
+            .background_color = track_bg,
+            .corner_radius = clay.CornerRadius.all((track_h - 2) / 2.0),
+        })({
+            // Knob
+            clay.UI()(.{
+                .id = clay.ElementId.ID(id ++ "-knob"),
+                .layout = .{
+                    .sizing = .{ .w = clay.SizingAxis.fixed(knob_size), .h = clay.SizingAxis.fixed(knob_size) },
+                },
+                .background_color = .{ 255, 255, 255, 255 },
+                .corner_radius = clay.CornerRadius.all(knob_size / 2.0),
+            })({});
+        });
     });
+}
+
+fn lerpF(a: f32, b: f32, t: f32) f32 {
+    return a + (b - a) * t;
 }
 
 var conn_idx: u16 = 0;

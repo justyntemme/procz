@@ -12,6 +12,7 @@ const theme = @import("theme");
 const graph = @import("graph");
 const display = @import("display");
 const column_ops = @import("column_ops");
+const font = @import("font");
 
 const builtin = @import("builtin");
 const slog = sokol.log;
@@ -132,6 +133,20 @@ const state = struct {
     var search_focused: bool = false;
     var cursor_blink_timer: f64 = 0;
     var consume_next_char: bool = false; // suppress CHAR after slash-to-focus
+    var cursor_pos: usize = 0; // cursor position within search_buf (0..search_len)
+    var selection_start: ?usize = null; // anchor for text selection (null = no selection)
+    var search_dragging: bool = false; // drag-selecting in search bar
+    var search_bar_x: f32 = 0; // cached search bar X from render commands
+
+    // Animation state
+    var search_width_anim: f32 = 200.0;
+    var sort_anim: f32 = 0.0;
+    var settings_anim: f32 = 0.0;
+    var tab_anim: f32 = 0.0; // 0=processes, 1=performance
+    var hover_anim: f32 = 0.0;
+    var hover_anim_index: ?usize = null;
+    var row_flash_map: std.AutoHashMap(process.pid_t, f32) = undefined;
+    var row_flash_inited: bool = false;
 
     // Snapshot interval tracking for GPU % computation
     var last_snapshot_time_ns: i128 = 0;
@@ -193,6 +208,10 @@ export fn init() void {
 
     // Init selection state
     state.selected_pids = std.AutoHashMap(process.pid_t, void).init(std.heap.page_allocator);
+
+    // Init animation state
+    state.row_flash_map = std.AutoHashMap(process.pid_t, f32).init(std.heap.page_allocator);
+    state.row_flash_inited = true;
 
     // Fetch total physical memory once
     state.total_memory = platform.getTotalMemory();
@@ -286,7 +305,18 @@ fn drainEvents() void {
                 state.exited_pids.clearRetainingCapacity();
 
                 // Compute deltas once per snapshot (O(N) with HashMap)
-                if (had_previous) computeDeltas();
+                if (had_previous) {
+                    computeDeltas();
+                    // Detect new PIDs for enter flash animation
+                    if (state.row_flash_inited and state.prev_map_inited) {
+                        var proc_iter = state.proc_map.iterator();
+                        while (proc_iter.next()) |entry| {
+                            if (!state.prev_map.contains(entry.key_ptr.*)) {
+                                state.row_flash_map.put(entry.key_ptr.*, 1.0) catch {};
+                            }
+                        }
+                    }
+                }
 
                 // Push graph data using pre-computed deltas
                 if (had_previous) pushGraphData();
@@ -587,6 +617,15 @@ export fn frame() void {
     }
     const is_selected: []const bool = is_selected_buf orelse &.{};
 
+    // Build row flash array from PID flash map
+    const row_flash_buf = frame_alloc.alloc(f32, display_count) catch null;
+    if (row_flash_buf) |buf| {
+        for (state.materialized_pids, 0..) |pid, idx| {
+            buf[idx] = if (state.row_flash_inited) (state.row_flash_map.get(pid) orelse 0) else 0;
+        }
+    }
+    const row_flash: []const f32 = row_flash_buf orelse &.{};
+
     // Update clear color to match theme background
     state.pass_action.colors[0].clear_value = .{
         .r = @as(f32, theme.bg[0]) / 255.0,
@@ -598,6 +637,70 @@ export fn frame() void {
     // Update cursor blink timer
     state.cursor_blink_timer += @as(f64, @floatCast(sapp.frameDuration()));
     if (state.cursor_blink_timer >= 1.0) state.cursor_blink_timer -= 1.0;
+
+    // --- Animation lerps (ease-out, ~0.18 blend per frame at 60fps) ---
+    // Search bar width
+    {
+        const target: f32 = if (state.search_focused or state.search_len > 0) 260.0 else 200.0;
+        const diff = target - state.search_width_anim;
+        if (@abs(diff) < 0.5) state.search_width_anim = target else state.search_width_anim += diff * 0.18;
+    }
+    // Sort indicator
+    {
+        const target: f32 = if (state.sort_column != .none) 1.0 else 0.0;
+        const diff = target - state.sort_anim;
+        if (@abs(diff) < 0.005) state.sort_anim = target else state.sort_anim += diff * 0.18;
+    }
+    // Settings popup
+    {
+        const target: f32 = if (state.settings_open) 1.0 else 0.0;
+        const diff = target - state.settings_anim;
+        if (@abs(diff) < 0.005) state.settings_anim = target else state.settings_anim += diff * 0.18;
+    }
+    // Tab indicator cross-fade
+    {
+        const target: f32 = if (state.active_tab == .performance) 1.0 else 0.0;
+        const diff = target - state.tab_anim;
+        if (@abs(diff) < 0.005) state.tab_anim = target else state.tab_anim += diff * 0.18;
+    }
+    // Row hover fade
+    {
+        if (state.hovered_index != null) {
+            if (state.hover_anim_index == null or state.hover_anim_index.? != state.hovered_index.?) {
+                state.hover_anim = 0;
+                state.hover_anim_index = state.hovered_index;
+            }
+            const diff = 1.0 - state.hover_anim;
+            if (@abs(diff) < 0.005) state.hover_anim = 1.0 else state.hover_anim += diff * 0.25;
+        } else {
+            const diff = 0.0 - state.hover_anim;
+            if (@abs(diff) < 0.005) {
+                state.hover_anim = 0;
+                state.hover_anim_index = null;
+            } else state.hover_anim += diff * 0.18;
+        }
+    }
+    // Row flash decay
+    if (state.row_flash_inited) {
+        var to_remove_buf: [64]process.pid_t = undefined;
+        var remove_count: usize = 0;
+        var flash_iter = state.row_flash_map.iterator();
+        while (flash_iter.next()) |entry| {
+            entry.value_ptr.* *= 0.93;
+            if (entry.value_ptr.* < 0.01 and remove_count < to_remove_buf.len) {
+                to_remove_buf[remove_count] = entry.key_ptr.*;
+                remove_count += 1;
+            }
+        }
+        for (to_remove_buf[0..remove_count]) |pid| {
+            _ = state.row_flash_map.remove(pid);
+        }
+    }
+    // Graph/sparkline display lerp
+    graph.cpu_history.lerpDisplay();
+    graph.mem_history.lerpDisplay();
+    graph.disk_history.lerpDisplay();
+    graph.lerpCoreDisplay();
 
     // Pre-fetch scroll position for processes tab virtualization.
     // getScrollContainerData returns data from previous frame's layout, which is fine.
@@ -619,19 +722,29 @@ export fn frame() void {
         .search_text = state.search_buf[0..state.search_len],
         .search_focused = state.search_focused,
         .cursor_visible = state.cursor_blink_timer < 0.5,
+        .cursor_pos = state.cursor_pos,
+        .selection_start = state.selection_start,
         .active_tab = state.active_tab,
+        .tab_anim = state.tab_anim,
+        .search_width_anim = state.search_width_anim,
+        .sort_anim = state.sort_anim,
+        .hover_anim = state.hover_anim,
+        .hover_anim_index = state.hover_anim_index,
+        .row_flash = row_flash,
         .viewport_height = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - theme.col_header_height - theme.footer_height,
         .scroll_y = proc_scroll_y,
     }, .{
         .settings_open = state.settings_open,
+        .settings_anim = state.settings_anim,
     });
 
-    // Extract graph area bounding boxes from render commands
+    // Extract bounding boxes from render commands
     {
         const cpu_id = clay.ElementId.ID("ga-cpu").id;
         const mem_id = clay.ElementId.ID("ga-mem").id;
         const disk_id = clay.ElementId.ID("ga-disk").id;
         const spark_id = clay.ElementId.ID("spark-area").id;
+        const search_id = clay.ElementId.ID("search-bar").id;
         graph.cpu_bounds = null;
         graph.mem_bounds = null;
         graph.disk_bounds = null;
@@ -647,6 +760,8 @@ export fn frame() void {
                     graph.disk_bounds = .{ .x = bb.x, .y = bb.y, .w = bb.width, .h = bb.height };
                 } else if (cmd.id == spark_id) {
                     graph.spark_bounds = .{ .x = bb.x, .y = bb.y, .w = bb.width, .h = bb.height };
+                } else if (cmd.id == search_id) {
+                    state.search_bar_x = bb.x;
                 }
             }
         }
@@ -728,6 +843,7 @@ export fn cleanup() void {
 
     state.exited_pids.deinit();
     state.selected_pids.deinit();
+    if (state.row_flash_inited) state.row_flash_map.deinit();
 
     renderer.shutdown();
     if (state.clay_memory.len > 0) {
@@ -748,6 +864,11 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         .MOUSE_MOVE => {
             state.mouse_x = e.mouse_x / dpi;
             state.mouse_y = e.mouse_y / dpi;
+            // Handle search bar text selection drag
+            if (state.search_dragging and state.search_len > 0) {
+                state.cursor_pos = cursorPosFromClick();
+                state.cursor_blink_timer = 0;
+            }
             // Handle column resize drag
             if (state.dragging_col) |col_idx| {
                 const delta = state.mouse_x - state.drag_start_x;
@@ -788,6 +909,14 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         },
         .MOUSE_UP => {
             if (e.mouse_button == .LEFT) {
+                // End search bar text selection drag
+                if (state.search_dragging) {
+                    state.search_dragging = false;
+                    // Collapse empty selection (click without drag)
+                    if (state.selection_start) |ss| {
+                        if (ss == state.cursor_pos) state.selection_start = null;
+                    }
+                }
                 if (state.header_drag_started) {
                     // Finalize column reorder
                     if (state.dragging_header) |src_col| {
@@ -812,13 +941,25 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         .CHAR => {
             if (state.consume_next_char) {
                 state.consume_next_char = false;
+            } else if ((e.modifiers & sapp.modifier_super) != 0) {
+                // Skip CHAR events when Cmd is held (e.g. Cmd+A, Cmd+C)
             } else if (state.search_focused) {
                 const cp = e.char_code;
                 // Only accept printable ASCII (space through tilde)
-                if (cp >= 32 and cp < 127 and state.search_len < state.search_buf.len - 1) {
-                    state.search_buf[state.search_len] = @intCast(cp);
-                    state.search_len += 1;
-                    state.cursor_blink_timer = 0;
+                if (cp >= 32 and cp < 127) {
+                    // Delete selection first if one exists
+                    if (state.selection_start != null) deleteSelection();
+                    if (state.search_len < state.search_buf.len - 1) {
+                        // Shift text after cursor right to make room
+                        var j: usize = state.search_len;
+                        while (j > state.cursor_pos) : (j -= 1) {
+                            state.search_buf[j] = state.search_buf[j - 1];
+                        }
+                        state.search_buf[state.cursor_pos] = @intCast(cp);
+                        state.search_len += 1;
+                        state.cursor_pos += 1;
+                        state.cursor_blink_timer = 0;
+                    }
                 }
             }
         },
@@ -830,16 +971,77 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 .UP => {
                     if (!state.search_focused) processKeyNav(.up);
                 },
-                .BACKSPACE, .DELETE => {
-                    if (state.search_focused and state.search_len > 0) {
-                        state.search_len -= 1;
-                        state.search_buf[state.search_len] = 0;
+                .BACKSPACE => {
+                    if (state.search_focused) {
+                        if (state.selection_start != null) {
+                            deleteSelection();
+                            state.cursor_blink_timer = 0;
+                        } else if (state.cursor_pos > 0) {
+                            // Shift text after cursor left
+                            var j: usize = state.cursor_pos - 1;
+                            while (j + 1 < state.search_len) : (j += 1) {
+                                state.search_buf[j] = state.search_buf[j + 1];
+                            }
+                            state.search_buf[state.search_len - 1] = 0;
+                            state.search_len -= 1;
+                            state.cursor_pos -= 1;
+                            state.cursor_blink_timer = 0;
+                        }
+                    }
+                },
+                .DELETE => {
+                    if (state.search_focused) {
+                        if (state.selection_start != null) {
+                            deleteSelection();
+                            state.cursor_blink_timer = 0;
+                        } else if (state.cursor_pos < state.search_len) {
+                            var j: usize = state.cursor_pos;
+                            while (j + 1 < state.search_len) : (j += 1) {
+                                state.search_buf[j] = state.search_buf[j + 1];
+                            }
+                            state.search_buf[state.search_len - 1] = 0;
+                            state.search_len -= 1;
+                            state.cursor_blink_timer = 0;
+                        }
+                    }
+                },
+                .LEFT => {
+                    if (state.search_focused) {
+                        if (state.selection_start != null) {
+                            const ss = state.selection_start.?;
+                            state.cursor_pos = @min(ss, state.cursor_pos);
+                            state.selection_start = null;
+                        } else if (state.cursor_pos > 0) {
+                            state.cursor_pos -= 1;
+                        }
+                        state.cursor_blink_timer = 0;
+                    }
+                },
+                .RIGHT => {
+                    if (state.search_focused) {
+                        if (state.selection_start != null) {
+                            const ss = state.selection_start.?;
+                            state.cursor_pos = @max(ss, state.cursor_pos);
+                            state.selection_start = null;
+                        } else if (state.cursor_pos < state.search_len) {
+                            state.cursor_pos += 1;
+                        }
+                        state.cursor_blink_timer = 0;
+                    }
+                },
+                .A => {
+                    // Cmd+A: select all text in search bar
+                    if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0 and state.search_len > 0) {
+                        state.selection_start = 0;
+                        state.cursor_pos = state.search_len;
                         state.cursor_blink_timer = 0;
                     }
                 },
                 .ESCAPE => {
                     if (state.search_focused) {
                         state.search_len = 0;
+                        state.cursor_pos = 0;
+                        state.selection_start = null;
                         @memset(&state.search_buf, 0);
                         state.search_focused = false;
                     } else if (state.settings_open) {
@@ -849,6 +1051,7 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 .SLASH => {
                     if (!state.search_focused and !state.settings_open) {
                         state.search_focused = true;
+                        state.cursor_pos = state.search_len;
                         state.cursor_blink_timer = 0;
                         state.consume_next_char = true; // suppress the '/' CHAR event
                     }
@@ -882,6 +1085,50 @@ fn hitTestColumnHeader(mx: f32, my: f32) ?u8 {
 
 fn findDropPosition(mx: f32) u8 {
     return column_ops.findDropPos(mx, procColumnConfig());
+}
+
+/// Compute cursor position in search text from mouse click X coordinate.
+fn cursorPosFromClick() usize {
+    // Text starts after: search_bar_x + padding(12) + icon_width + gap(6)
+    const icon_w = font.measure("\xe2\x8c\x98", 12).w;
+    const text_x = state.search_bar_x + 12.0 + icon_w + 6.0;
+    const rel_x = state.mouse_x - text_x;
+    if (rel_x <= 0) return 0;
+
+    const text = state.search_buf[0..state.search_len];
+    for (1..text.len + 1) |i| {
+        const w = font.measure(text[0..i], 14).w;
+        if (rel_x < w) {
+            const prev_w = if (i > 1) font.measure(text[0..i - 1], 14).w else 0;
+            const mid = (prev_w + w) / 2.0;
+            return if (rel_x < mid) i - 1 else i;
+        }
+    }
+    return text.len;
+}
+
+/// Delete the selected text range and collapse cursor to the start of the selection.
+fn deleteSelection() void {
+    const ss = state.selection_start orelse return;
+    const lo = @min(ss, state.cursor_pos);
+    const hi = @max(ss, state.cursor_pos);
+    if (lo == hi) {
+        state.selection_start = null;
+        return;
+    }
+    const sel_len = hi - lo;
+    // Shift text from hi..search_len down to lo
+    var j: usize = lo;
+    while (j + sel_len < state.search_len) : (j += 1) {
+        state.search_buf[j] = state.search_buf[j + sel_len];
+    }
+    // Zero out freed tail
+    while (j < state.search_len) : (j += 1) {
+        state.search_buf[j] = 0;
+    }
+    state.search_len -= sel_len;
+    state.cursor_pos = lo;
+    state.selection_start = null;
 }
 
 const NavDirection = enum { up, down };
@@ -1002,9 +1249,18 @@ fn processClick() void {
     if (clay.pointerOver(clay.ElementId.ID("search-bar"))) {
         state.search_focused = true;
         state.cursor_blink_timer = 0;
+        // Position cursor based on click location
+        if (state.search_len > 0 and state.search_bar_x > 0) {
+            state.cursor_pos = cursorPosFromClick();
+        } else {
+            state.cursor_pos = state.search_len;
+        }
+        state.selection_start = state.cursor_pos; // anchor for potential drag
+        state.search_dragging = true;
         return;
     } else if (state.search_focused) {
         state.search_focused = false;
+        state.selection_start = null;
     }
 
     // Check column header clicks for sorting

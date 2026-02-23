@@ -79,6 +79,10 @@ pub var cpu_bounds: ?Bounds = null;
 pub var mem_bounds: ?Bounds = null;
 pub var disk_bounds: ?Bounds = null;
 
+/// Clip region for graph overlays. When set, an sgl scissor is applied
+/// so graphs don't bleed over the header/tab bar when scrolled.
+pub var clip_bounds: ?Bounds = null;
+
 // ---------------------------------------------------------------------------
 // Per-core CPU sparkline data
 // ---------------------------------------------------------------------------
@@ -107,10 +111,27 @@ pub fn pushCoreData(utils: []const f32) void {
 // ---------------------------------------------------------------------------
 
 pub fn renderAll() void {
+    // Apply scissor so graphs don't bleed over header/tabs when scrolled
+    if (clip_bounds) |cb| {
+        const dpi = sokol.app.dpiScale();
+        sgl.scissorRectf(
+            cb.x * dpi,
+            cb.y * dpi,
+            cb.w * dpi,
+            cb.h * dpi,
+            true,
+        );
+    }
+
     if (cpu_bounds) |b| renderGraph(&cpu_history, b);
     if (mem_bounds) |b| renderGraph(&mem_history, b);
     if (disk_bounds) |b| renderGraph(&disk_history, b);
     if (spark_bounds) |b| renderSparklines(b);
+
+    // Reset scissor to full viewport
+    if (clip_bounds != null) {
+        sgl.scissorRectf(0, 0, sokol.app.widthf(), sokol.app.heightf(), true);
+    }
 }
 
 // ---------------------------------------------------------------------------

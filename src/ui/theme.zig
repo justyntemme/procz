@@ -11,9 +11,9 @@ pub const font_size_small: f32 = 14.0;
 
 // -- layout metrics --
 pub const row_height: f32 = 24.0;
-pub const header_height: f32 = 44.0;
+pub const header_height: f32 = 48.0;
 pub const col_header_height: f32 = 28.0;
-pub const footer_height: f32 = 32.0;
+pub const footer_height: f32 = 28.0;
 pub const indent_px: u16 = 20;
 
 // -- column widths (pixels) --

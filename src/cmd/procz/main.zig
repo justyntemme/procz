@@ -11,6 +11,7 @@ const producer = @import("producer");
 const theme = @import("theme");
 const graph = @import("graph");
 const display = @import("display");
+const column_ops = @import("column_ops");
 
 const builtin = @import("builtin");
 const slog = sokol.log;
@@ -619,7 +620,7 @@ export fn frame() void {
         .search_focused = state.search_focused,
         .cursor_visible = state.cursor_blink_timer < 0.5,
         .active_tab = state.active_tab,
-        .viewport_height = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - 28 - 32,
+        .viewport_height = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - theme.col_header_height - theme.footer_height,
         .scroll_y = proc_scroll_y,
     }, .{
         .settings_open = state.settings_open,
@@ -649,6 +650,18 @@ export fn frame() void {
                 }
             }
         }
+    }
+
+    // Set clip bounds for graph overlays so they don't bleed over header/tabs
+    {
+        const content_top = theme.header_height + theme.tab_bar_height;
+        const content_bottom = sapp.heightf() / dpi - theme.footer_height;
+        graph.clip_bounds = .{
+            .x = 0,
+            .y = content_top,
+            .w = sapp.widthf() / dpi,
+            .h = content_bottom - content_top,
+        };
     }
 
     // Update hover for next frame (post-layout detection)
@@ -779,35 +792,7 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                     // Finalize column reorder
                     if (state.dragging_header) |src_col| {
                         const drop_pos = findDropPosition(state.mouse_x);
-                        // Find current position of the dragged column
-                        var src_pos: u8 = 0;
-                        for (state.col_order, 0..) |c, p| {
-                            if (c == src_col) {
-                                src_pos = @intCast(p);
-                                break;
-                            }
-                        }
-                        if (src_pos != drop_pos) {
-                            // Remove from old position and insert at new position
-                            var new_order: [layout.COL_COUNT]u8 = undefined;
-                            var dst: u8 = 0;
-                            // Copy all except src
-                            for (state.col_order) |c| {
-                                if (c != src_col) {
-                                    new_order[dst] = c;
-                                    dst += 1;
-                                }
-                            }
-                            // Insert src_col at drop_pos (clamped to new length)
-                            const insert_at = @min(drop_pos, layout.COL_COUNT - 1);
-                            // Shift elements right to make room
-                            var j: u8 = layout.COL_COUNT - 1;
-                            while (j > insert_at) : (j -= 1) {
-                                new_order[j] = new_order[j - 1];
-                            }
-                            new_order[insert_at] = src_col;
-                            state.col_order = new_order;
-                        }
+                        column_ops.reorder(&state.col_order, src_col, drop_pos, layout.COL_COUNT);
                     }
                 } else if (state.dragging_header != null) {
                     // Threshold not met — treat as a simple header click (sort)
@@ -875,61 +860,28 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
     }
 }
 
-/// Test if mouse position is near a column header's right edge (resize handle).
-/// Returns the logical column index if within the resize zone, null otherwise.
+fn procColumnConfig() column_ops.ColumnConfig {
+    return .{
+        .col_widths = &state.col_widths,
+        .col_order = &state.col_order,
+        .col_count = layout.COL_COUNT,
+        .grow_col_idx = @intFromEnum(layout.Col.path),
+        .header_top = theme.header_height + theme.tab_bar_height,
+        .header_height = theme.col_header_height,
+        .left_pad = 14.0,
+    };
+}
+
 fn hitTestColumnEdge(mx: f32, my: f32) ?u8 {
-    // Column header area: Y from header + tab bar to + col_header_height
-    const header_top = theme.header_height + theme.tab_bar_height;
-    const header_bottom = header_top + theme.col_header_height;
-    if (my < header_top or my > header_bottom) return null;
-
-    const edge_tolerance: f32 = 5.0;
-    const left_pad: f32 = 14.0; // matches row padding.left in layout
-
-    var edge_x: f32 = left_pad;
-    for (state.col_order) |col_idx| {
-        if (col_idx == @intFromEnum(layout.Col.path)) continue; // PATH is grow, no resize
-        edge_x += state.col_widths[col_idx];
-        if (@abs(mx - edge_x) <= edge_tolerance) {
-            return col_idx;
-        }
-    }
-    return null;
+    return column_ops.hitTestEdge(mx, my, procColumnConfig());
 }
 
-/// Test if mouse position is over a column header body (not the resize handle edge).
-/// Returns the logical column index, null if not over any header.
 fn hitTestColumnHeader(mx: f32, my: f32) ?u8 {
-    const header_top = theme.header_height + theme.tab_bar_height;
-    const header_bottom = header_top + theme.col_header_height;
-    if (my < header_top or my > header_bottom) return null;
-
-    // Don't start header drag if we're on a resize edge
-    if (hitTestColumnEdge(mx, my) != null) return null;
-
-    const left_pad: f32 = 14.0;
-    var edge_x: f32 = left_pad;
-    for (state.col_order) |col_idx| {
-        const w: f32 = if (col_idx == @intFromEnum(layout.Col.path)) 9999 else state.col_widths[col_idx];
-        if (mx >= edge_x and mx < edge_x + w) {
-            return col_idx;
-        }
-        edge_x += w;
-    }
-    return null;
+    return column_ops.hitTestHeader(mx, my, procColumnConfig());
 }
 
-/// Find the display position index where a column should be dropped based on mouse X.
 fn findDropPosition(mx: f32) u8 {
-    const left_pad: f32 = 14.0;
-    var edge_x: f32 = left_pad;
-    for (state.col_order, 0..) |col_idx, pos| {
-        const w: f32 = if (col_idx == @intFromEnum(layout.Col.path)) 9999 else state.col_widths[col_idx];
-        const mid = edge_x + w / 2.0;
-        if (mx < mid) return @intCast(pos);
-        edge_x += w;
-    }
-    return layout.COL_COUNT - 1;
+    return column_ops.findDropPos(mx, procColumnConfig());
 }
 
 const NavDirection = enum { up, down };

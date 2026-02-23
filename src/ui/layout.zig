@@ -1,5 +1,6 @@
 const clay = @import("zclay");
 const theme = @import("theme");
+const column_ops = @import("column_ops");
 
 // ---------------------------------------------------------------------------
 // Public types consumed by main.zig
@@ -158,6 +159,10 @@ fn buildHeader(summary: SystemSummary, menu: MenuState, interaction: Interaction
             .child_gap = 12,
         },
         .background_color = theme.header_bg,
+        .border = .{
+            .color = theme.separator,
+            .width = .{ .bottom = 1 },
+        },
     })({
         clay.text("procz", .{ .color = theme.text_title, .font_size = 18 });
 
@@ -292,6 +297,12 @@ fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool) voi
     })({
         clay.text(label, .{ .color = text_color, .font_size = 14 });
 
+        // Spacer pushes indicator to bottom edge with breathing room from text
+        clay.UI()(.{
+            .id = clay.ElementId.ID(id ++ "-sp"),
+            .layout = .{ .sizing = .{ .h = clay.SizingAxis.grow } },
+        })({});
+
         // Active indicator: 2px accent bar at bottom edge
         if (is_active) {
             clay.UI()(.{
@@ -300,6 +311,7 @@ fn buildTabItem(comptime id: []const u8, label: []const u8, is_active: bool) voi
                     .sizing = .{ .w = clay.SizingAxis.grow, .h = clay.SizingAxis.fixed(2) },
                 },
                 .background_color = theme.accent,
+                .corner_radius = clay.CornerRadius.all(1),
             })({});
         }
     });
@@ -327,6 +339,10 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
                 .direction = .left_to_right,
             },
             .background_color = theme.col_header_bg,
+            .border = .{
+                .color = theme.separator,
+                .width = .{ .bottom = 1 },
+            },
         })({
             for (interaction.col_order) |col_idx| {
                 const col: Col = @enumFromInt(col_idx);
@@ -496,11 +512,15 @@ fn buildPerfGraphSection(
         .layout = .{
             .sizing = .{ .w = clay.SizingAxis.grow, .h = clay.SizingAxis.fixed(220) },
             .direction = .top_to_bottom,
-            .padding = clay.Padding.all(8),
-            .child_gap = 4,
+            .padding = clay.Padding.all(12),
+            .child_gap = 6,
         },
         .background_color = theme.graph_section_bg,
         .corner_radius = clay.CornerRadius.all(theme.corner_radius),
+        .border = .{
+            .color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 50 },
+            .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
+        },
     })({
         // Title
         clay.text(title, .{ .color = theme.text_header, .font_size = 16 });
@@ -570,6 +590,10 @@ fn buildCpuCores(summary: SystemSummary, tall: bool) void {
             .child_gap = 4,
         },
         .background_color = theme.col_header_bg,
+        .border = .{
+            .color = theme.separator,
+            .width = .{ .top = 1 },
+        },
     })({
         clay.text("CPU Cores", .{ .color = theme.text_header, .font_size = 14 });
 
@@ -598,6 +622,10 @@ fn buildFooter() void {
             .child_alignment = .{ .x = .left, .y = .center },
         },
         .background_color = theme.footer_bg,
+        .border = .{
+            .color = theme.separator,
+            .width = .{ .top = 1 },
+        },
     })({
         clay.text("\xe2\x86\x91\xe2\x86\x93 navigate  \xc2\xb7  / search  \xc2\xb7  \xe2\x8c\x98, settings", .{
             .color = theme.text_footer,
@@ -764,18 +792,16 @@ fn buildSettingsPopup() void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the X offset for the drop indicator (relative to col-hdr bounding box).
 fn computeDropX(interaction: InteractionState) f32 {
-    const mx = interaction.drag_header_x;
-    const left_pad: f32 = 14.0; // matches col-hdr horizontal padding
-    var edge_x: f32 = left_pad;
-    for (interaction.col_order) |col_idx| {
-        const w: f32 = if (col_idx == @intFromEnum(Col.path)) 200 else interaction.col_widths[col_idx];
-        const mid = edge_x + w / 2.0;
-        if (mx < mid) return edge_x;
-        edge_x += w;
-    }
-    return edge_x;
+    return column_ops.computeDropX(interaction.drag_header_x, .{
+        .col_widths = &interaction.col_widths,
+        .col_order = &interaction.col_order,
+        .col_count = COL_COUNT,
+        .grow_col_idx = @intFromEnum(Col.path),
+        .header_top = theme.header_height + theme.tab_bar_height,
+        .header_height = theme.col_header_height,
+        .left_pad = 14.0,
+    });
 }
 
 fn colHeaderGrow(comptime id: []const u8, label: []const u8) void {

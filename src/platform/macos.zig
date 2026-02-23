@@ -34,6 +34,7 @@ const c = @cImport({
     @cInclude("sys/resource.h");
     @cInclude("mach/mach.h");
     @cInclude("macos_gpu.h");
+    @cInclude("arpa/inet.h");
 });
 
 /// Collect data for a single process by PID. Returns null if the process
@@ -327,4 +328,191 @@ fn mapState(status: u32) _ProcessState {
         c.SZOMB => .zombie,
         else => .unknown,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Coalition ID & TCP connections (for Network tab)
+// ---------------------------------------------------------------------------
+
+const PROC_PIDCOALITIONINFO: c_int = 20;
+const COALITION_NUM_TYPES = 2;
+
+const CoalitionInfo = extern struct {
+    coalition_id: [COALITION_NUM_TYPES]u64,
+    reserved1: u64,
+    reserved2: u64,
+    reserved3: u64,
+};
+
+/// Get resource coalition ID for a process (groups app with its XPC services).
+pub fn getCoalitionId(pid: _pid_t) u64 {
+    var info: CoalitionInfo = std.mem.zeroes(CoalitionInfo);
+    const ret = c.proc_pidinfo(pid, PROC_PIDCOALITIONINFO, 0, &info, @sizeOf(CoalitionInfo));
+    if (ret > 0) {
+        return info.coalition_id[0];
+    }
+    return 0;
+}
+
+/// Collect all TCP connections system-wide via sysctl("net.inet.tcp.pcblist_n").
+/// Caller should filter by PID / coalition_id as needed.
+pub fn collectTcpConnections(arena: std.mem.Allocator) PlatformError![]process.TcpConnection {
+    var len: usize = 0;
+    const name = "net.inet.tcp.pcblist_n";
+
+    if (c.sysctlbyname(name, null, &len, null, 0) != 0) {
+        return arena.alloc(process.TcpConnection, 0) catch return error.OutOfMemory;
+    }
+    if (len == 0) {
+        return arena.alloc(process.TcpConnection, 0) catch return error.OutOfMemory;
+    }
+
+    const buf = arena.alloc(u8, len) catch return error.OutOfMemory;
+    if (c.sysctlbyname(name, buf.ptr, &len, null, 0) != 0) {
+        return arena.alloc(process.TcpConnection, 0) catch return error.OutOfMemory;
+    }
+
+    var connections: std.ArrayListUnmanaged(process.TcpConnection) = .empty;
+
+    if (len < 24) {
+        return connections.toOwnedSlice(arena) catch return error.OutOfMemory;
+    }
+
+    const xig_len = std.mem.readInt(u32, buf[0..4], .little);
+    var offset: usize = xig_len;
+
+    const XSO_SOCKET: u32 = 0x001;
+    const XSO_INPCB: u32 = 0x010;
+    const XSO_TCPCB: u32 = 0x020;
+
+    var have_inpcb = false;
+    var local_port: u16 = 0;
+    var foreign_port: u16 = 0;
+    var local_addr: [16]u8 = undefined;
+    var foreign_addr: [16]u8 = undefined;
+    var is_ipv6: bool = false;
+    var pid: i32 = 0;
+    var coalition_id: u64 = 0;
+    var tcp_state: i32 = 0;
+
+    while (offset + 8 <= len) {
+        var xt_len = std.mem.readInt(u32, buf[offset..][0..4], .little);
+        var xt_kind = std.mem.readInt(u32, buf[offset + 4 ..][0..4], .little);
+
+        // Footer check
+        if (xt_len == xig_len) {
+            if (have_inpcb and pid > 0) {
+                const conn = makeConnection(pid, coalition_id, local_port, foreign_port, &local_addr, &foreign_addr, is_ipv6, tcp_state);
+                connections.append(arena, conn) catch {};
+            }
+            break;
+        }
+
+        // Handle padding (xt_len=0) by scanning forward
+        if (xt_len == 0) {
+            var scan = offset;
+            while (scan + 8 <= len) {
+                scan += 4;
+                const try_len = std.mem.readInt(u32, buf[scan..][0..4], .little);
+                if (try_len >= 24 and try_len < 1024) {
+                    const try_kind = std.mem.readInt(u32, buf[scan + 4 ..][0..4], .little);
+                    if (try_kind >= 1 and try_kind <= 0x20) {
+                        offset = scan;
+                        xt_len = try_len;
+                        xt_kind = try_kind;
+                        break;
+                    }
+                }
+            }
+            if (xt_len == 0) break;
+        }
+
+        if (offset + xt_len > len) break;
+
+        if (xt_kind == XSO_INPCB and xt_len >= 64) {
+            // Save previous connection if any
+            if (have_inpcb and pid > 0) {
+                const conn = makeConnection(pid, coalition_id, local_port, foreign_port, &local_addr, &foreign_addr, is_ipv6, tcp_state);
+                connections.append(arena, conn) catch {};
+            }
+
+            have_inpcb = true;
+            pid = 0;
+            tcp_state = 0;
+
+            foreign_port = std.mem.readInt(u16, buf[offset + 16 ..][0..2], .big);
+            local_port = std.mem.readInt(u16, buf[offset + 18 ..][0..2], .big);
+            @memcpy(&foreign_addr, buf[offset + 48 ..][0..16]);
+            @memcpy(&local_addr, buf[offset + 64 ..][0..16]);
+
+            const vflag = buf[offset + 44];
+            is_ipv6 = (vflag & 0x2) != 0;
+        } else if (xt_kind == XSO_SOCKET and xt_len >= 72) {
+            pid = std.mem.readInt(i32, buf[offset + 68 ..][0..4], .little);
+            coalition_id = if (pid > 0) getCoalitionId(pid) else 0;
+        } else if (xt_kind == XSO_TCPCB and xt_len >= 40) {
+            tcp_state = std.mem.readInt(i32, buf[offset + 36 ..][0..4], .little);
+        }
+
+        offset += xt_len;
+    }
+
+    return connections.toOwnedSlice(arena) catch return error.OutOfMemory;
+}
+
+fn makeConnection(pid: i32, coalition_id: u64, lport: u16, fport: u16, laddr: *const [16]u8, faddr: *const [16]u8, is_ipv6: bool, tcp_state: i32) process.TcpConnection {
+    var conn: process.TcpConnection = .{
+        .pid = pid,
+        .coalition_id = coalition_id,
+        .local_port = lport,
+        .remote_port = fport,
+        .local_addr = [_]u8{0} ** 46,
+        .local_addr_len = 0,
+        .remote_addr = [_]u8{0} ** 46,
+        .remote_addr_len = 0,
+        .state = process.TcpState.fromKernelState(tcp_state),
+        .is_ipv6 = is_ipv6,
+    };
+
+    if (is_ipv6) {
+        var local_buf: [c.INET6_ADDRSTRLEN]u8 = undefined;
+        var remote_buf: [c.INET6_ADDRSTRLEN]u8 = undefined;
+
+        const local_ptr = c.inet_ntop(c.AF_INET6, laddr, &local_buf, c.INET6_ADDRSTRLEN);
+        const remote_ptr = c.inet_ntop(c.AF_INET6, faddr, &remote_buf, c.INET6_ADDRSTRLEN);
+
+        if (local_ptr != null) {
+            const local_str = std.mem.sliceTo(&local_buf, 0);
+            const copy_len = @min(local_str.len, conn.local_addr.len);
+            @memcpy(conn.local_addr[0..copy_len], local_str[0..copy_len]);
+            conn.local_addr_len = @intCast(copy_len);
+        }
+        if (remote_ptr != null) {
+            const remote_str = std.mem.sliceTo(&remote_buf, 0);
+            const copy_len = @min(remote_str.len, conn.remote_addr.len);
+            @memcpy(conn.remote_addr[0..copy_len], remote_str[0..copy_len]);
+            conn.remote_addr_len = @intCast(copy_len);
+        }
+    } else {
+        var local_buf: [c.INET_ADDRSTRLEN]u8 = undefined;
+        var remote_buf: [c.INET_ADDRSTRLEN]u8 = undefined;
+
+        const local_ptr = c.inet_ntop(c.AF_INET, laddr[12..16], &local_buf, c.INET_ADDRSTRLEN);
+        const remote_ptr = c.inet_ntop(c.AF_INET, faddr[12..16], &remote_buf, c.INET_ADDRSTRLEN);
+
+        if (local_ptr != null) {
+            const local_str = std.mem.sliceTo(&local_buf, 0);
+            const copy_len = @min(local_str.len, conn.local_addr.len);
+            @memcpy(conn.local_addr[0..copy_len], local_str[0..copy_len]);
+            conn.local_addr_len = @intCast(copy_len);
+        }
+        if (remote_ptr != null) {
+            const remote_str = std.mem.sliceTo(&remote_buf, 0);
+            const copy_len = @min(remote_str.len, conn.remote_addr.len);
+            @memcpy(conn.remote_addr[0..copy_len], remote_str[0..copy_len]);
+            conn.remote_addr_len = @intCast(copy_len);
+        }
+    }
+
+    return conn;
 }

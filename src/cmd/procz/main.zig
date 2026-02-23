@@ -8,9 +8,9 @@ const renderer = @import("renderer");
 const layout = @import("layout");
 const channel = @import("channel");
 const producer = @import("producer");
-const font = @import("font");
 const theme = @import("theme");
 const graph = @import("graph");
+const display = @import("display");
 
 const builtin = @import("builtin");
 const slog = sokol.log;
@@ -62,8 +62,20 @@ const state = struct {
     var selected_pids: std.AutoHashMap(process.pid_t, void) = undefined;
     var anchor_pid: ?process.pid_t = null; // for future shift+click
 
-    // Display-index-to-PID mapping (rebuilt each frame from formatRowTexts)
-    var current_display_pids: []process.pid_t = &.{};
+    // Materialized display data (rebuilt once per snapshot or view param change)
+    var display_arena: std.heap.ArenaAllocator = undefined;
+    var materialized_rows: []layout.RowText = &.{};
+    var materialized_pids: []process.pid_t = &.{};
+    var materialized_summary: layout.SystemSummary = .{};
+    var display_dirty: bool = true;
+
+    // Cached view params for dirty detection
+    var cached_sort_column: layout.SortColumn = .none;
+    var cached_sort_direction: layout.SortDirection = .descending;
+    var cached_search_len: usize = 0;
+    var cached_search_buf: [128]u8 = [_]u8{0} ** 128;
+    var cached_col_widths: [6]f32 = .{ theme.col_pid, theme.col_name, theme.col_cpu, theme.col_mem, theme.col_disk, theme.col_gpu };
+    var cached_window_width: f32 = 0;
 
     // Hover (display index from previous frame)
     var hovered_index: ?usize = null;
@@ -93,6 +105,15 @@ const state = struct {
     var drag_start_x: f32 = 0;
     var drag_start_width: f32 = 0;
 
+    // Column order (display position → logical column index)
+    var col_order: [layout.COL_COUNT]u8 = layout.default_col_order;
+
+    // Column header drag-to-reorder state
+    var dragging_header: ?u8 = null; // logical column index being dragged
+    var header_drag_start_x: f32 = 0;
+    var header_drag_started: bool = false; // true once mouse moved enough to start drag
+    const header_drag_threshold: f32 = 5.0; // pixels before drag activates
+
     // Settings popup state
     var settings_open: bool = false;
 
@@ -116,13 +137,11 @@ const state = struct {
     var snapshot_interval_ns: u64 = 2 * std.time.ns_per_s; // default 2s
 
     // Previous snapshot values (HashMap for O(1) lookup)
-    const PrevEntry = struct { cpu: u64 = 0, disk: u64 = 0, gpu: u64 = 0 };
-    var prev_map: std.AutoHashMap(process.pid_t, PrevEntry) = undefined;
+    var prev_map: std.AutoHashMap(process.pid_t, display.PrevEntry) = undefined;
     var prev_map_inited: bool = false;
 
-    // Pre-computed deltas (rebuilt once per snapshot, read every frame)
-    const DeltaEntry = struct { cpu: u64 = 0, disk: u64 = 0, gpu: u64 = 0 };
-    var delta_map: std.AutoHashMap(process.pid_t, DeltaEntry) = undefined;
+    // Pre-computed deltas (rebuilt once per snapshot)
+    var delta_map: std.AutoHashMap(process.pid_t, display.DeltaEntry) = undefined;
     var delta_map_inited: bool = false;
 
     // Per-core CPU utilization
@@ -152,6 +171,7 @@ export fn init() void {
     // Init arenas
     state.snapshot_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     state.frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    state.display_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
     // Init Clay
     const min_mem: u32 = clay.minMemorySize();
@@ -286,6 +306,7 @@ fn drainEvents() void {
                     continue;
                 };
                 state.current_rows = rows;
+                state.display_dirty = true;
                 print("procz: snapshot {d} procs, {d} rows\n", .{ state.proc_count, rows.len });
             },
             .exit => |pid| {
@@ -299,7 +320,7 @@ fn drainEvents() void {
 
 fn savePreviousValues() void {
     if (!state.prev_map_inited) {
-        state.prev_map = std.AutoHashMap(process.pid_t, state.PrevEntry).init(std.heap.page_allocator);
+        state.prev_map = std.AutoHashMap(process.pid_t, display.PrevEntry).init(std.heap.page_allocator);
         state.prev_map_inited = true;
     }
     state.prev_map.clearRetainingCapacity();
@@ -317,7 +338,7 @@ fn savePreviousValues() void {
 /// Compute deltas once per snapshot. Called from drainEvents after savePreviousValues + map swap.
 fn computeDeltas() void {
     if (!state.delta_map_inited) {
-        state.delta_map = std.AutoHashMap(process.pid_t, state.DeltaEntry).init(std.heap.page_allocator);
+        state.delta_map = std.AutoHashMap(process.pid_t, display.DeltaEntry).init(std.heap.page_allocator);
         state.delta_map_inited = true;
     }
     state.delta_map.clearRetainingCapacity();
@@ -351,7 +372,7 @@ fn pushGraphData() void {
     var iter = state.proc_map.iterator();
     while (iter.next()) |entry| {
         const p = entry.value_ptr.*;
-        const d = state.delta_map.get(p.pid) orelse state.DeltaEntry{};
+        const d = state.delta_map.get(p.pid) orelse display.DeltaEntry{};
         insertTopInfo(&top_cpu, &cpu_count, p.name, @floatFromInt(d.cpu));
         insertTopInfo(&top_mem, &mem_count, p.name, @floatFromInt(p.mem_rss));
         insertTopInfo(&top_disk, &disk_count, p.name, @floatFromInt(d.disk));
@@ -442,6 +463,80 @@ fn updateCoreUtilization() void {
     graph.pushCoreData(state.core_utils[0..state.core_count]);
 }
 
+/// Check if view params changed since last materialization.
+fn viewParamsChanged() bool {
+    const dpi = sapp.dpiScale();
+    const win_w = sapp.widthf() / dpi;
+
+    if (state.cached_sort_column != state.sort_column) return true;
+    if (state.cached_sort_direction != state.sort_direction) return true;
+    if (state.cached_search_len != state.search_len) return true;
+    if (state.cached_search_len > 0 and
+        !std.mem.eql(u8, state.cached_search_buf[0..state.cached_search_len], state.search_buf[0..state.search_len]))
+        return true;
+    if (@abs(win_w - state.cached_window_width) > 0.5) return true;
+    for (0..6) |i| {
+        if (@abs(state.col_widths[i] - state.cached_col_widths[i]) > 0.5) return true;
+    }
+    return false;
+}
+
+/// Snapshot cached view params after materialization.
+fn snapshotViewParams() void {
+    const dpi = sapp.dpiScale();
+    state.cached_sort_column = state.sort_column;
+    state.cached_sort_direction = state.sort_direction;
+    state.cached_search_len = state.search_len;
+    @memcpy(state.cached_search_buf[0..state.search_len], state.search_buf[0..state.search_len]);
+    state.cached_col_widths = state.col_widths;
+    state.cached_window_width = sapp.widthf() / dpi;
+}
+
+/// Materialize display data if dirty or view params changed.
+fn materializeIfNeeded() void {
+    if (!state.has_snapshot) return;
+    if (!state.display_dirty and !viewParamsChanged()) return;
+
+    _ = state.display_arena.reset(.retain_capacity);
+    const alloc = state.display_arena.allocator();
+
+    const dpi = sapp.dpiScale();
+    const win_w = sapp.widthf() / dpi;
+
+    // Ensure delta_map is initialized (may be empty before first delta)
+    if (!state.delta_map_inited) {
+        state.delta_map = std.AutoHashMap(process.pid_t, display.DeltaEntry).init(std.heap.page_allocator);
+        state.delta_map_inited = true;
+    }
+
+    const result = display.materialize(alloc, .{
+        .rows = state.current_rows,
+        .tree_pids = state.tree_result.pids,
+        .proc_map = &state.proc_map,
+        .delta_map = &state.delta_map,
+        .exited_pids = &state.exited_pids,
+        .sort_column = state.sort_column,
+        .sort_direction = state.sort_direction,
+        .search_text = state.search_buf[0..state.search_len],
+        .col_widths = state.col_widths,
+        .window_width = win_w,
+        .snapshot_interval_ns = state.snapshot_interval_ns,
+        .core_count = state.core_count,
+        .total_memory = state.total_memory,
+        .proc_count = state.proc_count,
+        .core_utils = state.core_utils[0..state.core_count],
+    }) catch |err| {
+        print("procz: materialize failed: {}\n", .{err});
+        return;
+    };
+
+    state.materialized_rows = result.rows;
+    state.materialized_pids = result.display_pids;
+    state.materialized_summary = result.summary;
+    state.display_dirty = false;
+    snapshotViewParams();
+}
+
 export fn frame() void {
     // Reset frame arena each frame
     _ = state.frame_arena.reset(.retain_capacity);
@@ -455,8 +550,8 @@ export fn frame() void {
     // Drain events from producer thread
     drainEvents();
 
-    // Pre-format RowText slices for the layout
-    const row_texts = formatRowTexts(frame_alloc) catch &.{};
+    // Materialize display data if needed (once per snapshot or view param change)
+    materializeIfNeeded();
 
     // Set Clay viewport dimensions (logical pixels, not framebuffer pixels)
     const dpi = sapp.dpiScale();
@@ -481,14 +576,11 @@ export fn frame() void {
         state.pending_scroll_index = null;
     }
 
-    // Compute summary for right panel
-    const summary = computeSummary(frame_alloc);
-
-    // Build is_selected parallel array from selected_pids + current_display_pids
-    const display_count = state.current_display_pids.len;
+    // Build is_selected parallel array from selected_pids + materialized_pids
+    const display_count = state.materialized_pids.len;
     const is_selected_buf = frame_alloc.alloc(bool, display_count) catch null;
     if (is_selected_buf) |buf| {
-        for (state.current_display_pids, 0..) |pid, i| {
+        for (state.materialized_pids, 0..) |pid, i| {
             buf[i] = state.selected_pids.contains(pid);
         }
     }
@@ -506,18 +598,29 @@ export fn frame() void {
     state.cursor_blink_timer += @as(f64, @floatCast(sapp.frameDuration()));
     if (state.cursor_blink_timer >= 1.0) state.cursor_blink_timer -= 1.0;
 
+    // Pre-fetch scroll position for processes tab virtualization.
+    // getScrollContainerData returns data from previous frame's layout, which is fine.
+    // We can't use getScrollOffset() for this because it must be called inline
+    // with the clip config (after clay.UI() opens the element).
+    const proc_scroll_data = clay.getScrollContainerData(clay.ElementId.ID("scroll"));
+    const proc_scroll_y: f32 = if (proc_scroll_data.found) -proc_scroll_data.scroll_position.y else 0;
+
     // Build layout and get render commands
-    const commands = layout.buildLayout(row_texts, summary, .{
+    const commands = layout.buildLayout(state.materialized_rows, state.materialized_summary, .{
         .is_selected = is_selected,
         .hovered_index = state.hovered_index,
         .sort_column = state.sort_column,
         .sort_direction = state.sort_direction,
         .col_widths = state.col_widths,
+        .col_order = state.col_order,
+        .dragging_header = if (state.header_drag_started) state.dragging_header else null,
+        .drag_header_x = state.mouse_x,
         .search_text = state.search_buf[0..state.search_len],
         .search_focused = state.search_focused,
         .cursor_visible = state.cursor_blink_timer < 0.5,
         .active_tab = state.active_tab,
         .viewport_height = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - 28 - 32,
+        .scroll_y = proc_scroll_y,
     }, .{
         .settings_open = state.settings_open,
     });
@@ -563,6 +666,23 @@ export fn frame() void {
         state.mouse_clicked = false;
     }
 
+    // Update cursor: resize / grab / default
+    if (state.dragging_col != null) {
+        sapp.setMouseCursor(.RESIZE_EW);
+    } else if (state.header_drag_started) {
+        sapp.setMouseCursor(.RESIZE_ALL);
+    } else if (hitTestColumnEdge(state.mouse_x, state.mouse_y) != null) {
+        sapp.setMouseCursor(.RESIZE_EW);
+    } else if (hitTestColumnHeader(state.mouse_x, state.mouse_y) != null) {
+        sapp.setMouseCursor(.POINTING_HAND);
+    } else {
+        sapp.setMouseCursor(.DEFAULT);
+    }
+
+    // Pass mouse to graph for sparkline tooltip hit-testing
+    graph.mouse_x = state.mouse_x;
+    graph.mouse_y = state.mouse_y;
+
     // Render
     sg.beginPass(.{
         .action = state.pass_action,
@@ -571,441 +691,6 @@ export fn frame() void {
     renderer.render(commands);
     sg.endPass();
     sg.commit();
-}
-
-const TreeEntry = struct {
-    pid: process.pid_t,
-    proc_data: process.Proc,
-    depth: u16,
-    cpu_delta: u64 = 0,
-    disk_delta: u64 = 0,
-    gpu_delta: u64 = 0,
-};
-
-fn formatRowTexts(alloc: std.mem.Allocator) ![]layout.RowText {
-    if (!state.has_snapshot or state.current_rows.len == 0) {
-        state.current_display_pids = &.{};
-        return &.{};
-    }
-
-    const rows = state.current_rows;
-
-    // First pass: filter out exited PIDs
-    var filtered: std.ArrayListUnmanaged(TreeEntry) = .empty;
-    try filtered.ensureTotalCapacity(alloc, rows.len);
-
-    for (rows) |row| {
-        const pid = state.tree_result.pids[row.index];
-        if (state.exited_pids.contains(pid)) continue;
-        const p = state.proc_map.get(pid) orelse continue;
-
-        // Use pre-computed deltas (O(1) HashMap lookup)
-        const d = state.delta_map.get(pid) orelse state.DeltaEntry{};
-        filtered.appendAssumeCapacity(.{ .pid = pid, .proc_data = p, .depth = row.depth, .cpu_delta = d.cpu, .disk_delta = d.disk, .gpu_delta = d.gpu });
-    }
-
-    // Search filter
-    const query = state.search_buf[0..state.search_len];
-    if (query.len > 0) {
-        var w: usize = 0;
-        for (filtered.items) |entry| {
-            if (caseInsensitiveContains(entry.proc_data.name, query) or
-                caseInsensitiveContains(entry.proc_data.path, query))
-            {
-                filtered.items[w] = entry;
-                w += 1;
-            }
-        }
-        filtered.shrinkRetainingCapacity(w);
-    }
-
-    // Sort if a sort column is active (replaces tree order with flat sort)
-    const is_sorted = state.sort_column != .none;
-    if (is_sorted) {
-        const sort_ctx = SortContext{ .column = state.sort_column, .direction = state.sort_direction };
-        std.mem.sortUnstable(TreeEntry, filtered.items, sort_ctx, sortCompare);
-    }
-    const items = filtered.items;
-
-    // Build parallel PID mapping for selection tracking
-    var pid_list: std.ArrayListUnmanaged(process.pid_t) = .empty;
-    try pid_list.ensureTotalCapacity(alloc, items.len);
-    for (items) |entry| {
-        pid_list.appendAssumeCapacity(entry.pid);
-    }
-    state.current_display_pids = try pid_list.toOwnedSlice(alloc);
-
-    // Compute dynamic path pixel budget from the full window width
-    const dpi = sapp.dpiScale();
-    const table_w = sapp.widthf() / dpi;
-    const path_budget = table_w - state.col_widths[0] - state.col_widths[1] - state.col_widths[2] - state.col_widths[3] - state.col_widths[4] - state.col_widths[5] - 24;
-
-    // System-relative intensity normalization (like Windows Task Manager):
-    // CPU: fraction of total CPU capacity (all cores × snapshot interval)
-    // MEM: fraction of total physical RAM
-    // DISK: fraction of reference throughput (~100MB/s)
-    // GPU: fraction of GPU time capacity
-    const total_mem_f: f64 = if (state.total_memory > 0) @floatFromInt(state.total_memory) else 1.0;
-    const interval_f: f64 = @floatFromInt(@max(state.snapshot_interval_ns, 1));
-    const cores_f: f64 = @floatFromInt(@max(state.core_count, 1));
-    const cpu_capacity: f64 = interval_f * cores_f;
-    const disk_ref: f64 = 200.0 * 1024.0 * 1024.0; // ~100MB/s at 2s intervals
-
-    // Second pass: build RowTexts (tree prefixes only when not sorted)
-    var texts: std.ArrayListUnmanaged(layout.RowText) = .empty;
-    try texts.ensureTotalCapacity(alloc, items.len);
-
-    var is_last: [64]bool = [_]bool{false} ** 64;
-
-    for (items, 0..) |entry, i| {
-        var prefix: []const u8 = "";
-        if (!is_sorted) {
-            const last = isLastSibling(items, i);
-            is_last[entry.depth] = last;
-            prefix = buildTreePrefix(entry.depth, &is_last, last, alloc);
-        }
-        const cpu_delta = entry.cpu_delta;
-        const disk_delta = entry.disk_delta;
-        const gpu_delta = entry.gpu_delta;
-
-        // System-relative intensity (like Windows Task Manager)
-        const cpu_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(cpu_delta)) / cpu_capacity, 1.0));
-        const mem_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(entry.proc_data.mem_rss)) / total_mem_f, 1.0));
-        const disk_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(disk_delta)) / disk_ref, 1.0));
-        const gpu_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(gpu_delta)) / interval_f, 1.0));
-
-        texts.appendAssumeCapacity(.{
-            .pid_str = truncateToFit(
-                std.fmt.allocPrint(alloc, "{d}", .{entry.pid}) catch "?",
-                state.col_widths[0],
-                theme.font_size,
-                alloc,
-            ),
-            .name_prefix = prefix,
-            .name = entry.proc_data.name,
-            .cpu_str = truncateToFit(
-                formatCpuPercent(alloc, cpu_delta, state.snapshot_interval_ns) catch "0%",
-                state.col_widths[2],
-                theme.font_size,
-                alloc,
-            ),
-            .mem_str = truncateToFit(
-                formatRss(alloc, entry.proc_data.mem_rss) catch "?",
-                state.col_widths[3],
-                theme.font_size,
-                alloc,
-            ),
-            .disk_str = truncateToFit(
-                formatDiskRate(alloc, disk_delta, state.snapshot_interval_ns) catch "0 B/s",
-                state.col_widths[4],
-                theme.font_size,
-                alloc,
-            ),
-            .gpu_str = truncateToFit(
-                formatGpuPercent(alloc, gpu_delta, state.snapshot_interval_ns) catch "0%",
-                state.col_widths[5],
-                theme.font_size,
-                alloc,
-            ),
-            .path_str = if (path_budget > 30)
-                middleTruncatePathToFit(entry.proc_data.path, path_budget, theme.font_size, alloc)
-            else
-                "",
-            .full_path = entry.proc_data.path,
-            .depth = if (is_sorted) 0 else entry.depth,
-            .cpu_intensity = cpu_intensity,
-            .mem_intensity = mem_intensity,
-            .disk_intensity = disk_intensity,
-            .gpu_intensity = gpu_intensity,
-            .raw_cpu = cpu_delta,
-            .raw_mem = entry.proc_data.mem_rss,
-            .raw_disk = disk_delta,
-            .raw_gpu = gpu_delta,
-            .pid = entry.pid,
-        });
-    }
-
-    return texts.toOwnedSlice(alloc);
-}
-
-const SortContext = struct {
-    column: layout.SortColumn,
-    direction: layout.SortDirection,
-};
-
-fn sortCompare(ctx: SortContext, a: TreeEntry, b: TreeEntry) bool {
-    const order = switch (ctx.column) {
-        .name => std.mem.order(u8, a.proc_data.name, b.proc_data.name),
-        .cpu => std.math.order(a.cpu_delta, b.cpu_delta),
-        .mem => std.math.order(a.proc_data.mem_rss, b.proc_data.mem_rss),
-        .disk => std.math.order(a.disk_delta, b.disk_delta),
-        .gpu => std.math.order(a.gpu_delta, b.gpu_delta),
-        .none => .eq,
-    };
-    return switch (ctx.direction) {
-        .ascending => order == .lt,
-        .descending => order == .gt,
-    };
-}
-
-fn caseInsensitiveContains(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    const limit = haystack.len - needle.len + 1;
-    for (0..limit) |i| {
-        var match = true;
-        for (0..needle.len) |j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return true;
-    }
-    return false;
-}
-
-fn isLastSibling(entries: []const TreeEntry, i: usize) bool {
-    const d = entries[i].depth;
-    var j = i + 1;
-    while (j < entries.len) : (j += 1) {
-        if (entries[j].depth < d) return true; // hit parent boundary
-        if (entries[j].depth == d) return false; // found sibling
-    }
-    return true; // end of list
-}
-
-fn buildTreePrefix(depth: u16, is_last_arr: *const [64]bool, self_is_last: bool, alloc: std.mem.Allocator) []const u8 {
-    if (depth == 0) return "";
-
-    const d: usize = @intCast(depth);
-    // Each ancestor: "│ " (3+1=4 bytes) or "  " (2 bytes)
-    // Connector: "├─" or "└─" (3+3=6 bytes) + trailing space (1 byte)
-    const max_len = (d - 1) * 4 + 7;
-    var parts: std.ArrayListUnmanaged(u8) = .empty;
-    parts.ensureTotalCapacity(alloc, max_len) catch return "";
-
-    // Ancestor segments: levels 1..d-1
-    // Each ancestor gets "│ " (continuing) or "  " (past-last)
-    var level: usize = 1;
-    while (level < d) : (level += 1) {
-        if (is_last_arr[level]) {
-            parts.appendSliceAssumeCapacity("  "); // ancestor was last child, no line
-        } else {
-            parts.appendSliceAssumeCapacity("\xe2\x94\x82 "); // │ + space
-        }
-    }
-
-    // Connector segment at this depth
-    if (self_is_last) {
-        parts.appendSliceAssumeCapacity("\xe2\x94\x94\xe2\x94\x80"); // └─
-    } else {
-        parts.appendSliceAssumeCapacity("\xe2\x94\x9c\xe2\x94\x80"); // ├─
-    }
-
-    // Trailing space before name
-    parts.appendAssumeCapacity(' ');
-
-    return parts.items;
-}
-
-/// Middle-truncate a path to fit within a pixel budget, using font.measure() for accuracy.
-fn middleTruncatePathToFit(path: []const u8, max_px: f32, size: f32, alloc: std.mem.Allocator) []const u8 {
-    if (path.len == 0) return path;
-    const m = font.measure(path, size);
-    if (m.w <= max_px) return path;
-
-    // Estimate max_chars from pixel budget using average char width
-    const avg_char_w = m.w / @as(f32, @floatFromInt(path.len));
-    if (avg_char_w <= 0) return path;
-    var max_chars: usize = @intFromFloat(@max(max_px / avg_char_w, 6));
-
-    // Iteratively shrink until it fits (up to 10 iterations)
-    var result = platform.middleTruncatePath(path, max_chars, alloc);
-    var iterations: usize = 0;
-    while (iterations < 10) : (iterations += 1) {
-        const measured = font.measure(result, size);
-        if (measured.w <= max_px) break;
-        if (max_chars <= 6) break;
-        max_chars -= 1;
-        result = platform.middleTruncatePath(path, max_chars, alloc);
-    }
-    return result;
-}
-
-/// Truncate text so its rendered width fits within max_px pixels at the given font size.
-/// If truncated, appends ".." to indicate overflow. Returns the original slice if it fits.
-fn truncateToFit(text: []const u8, max_px: f32, size: f32, alloc: std.mem.Allocator) []const u8 {
-    if (text.len == 0) return text;
-    const m = font.measure(text, size);
-    if (m.w <= max_px) return text;
-
-    // Find the last character that fits, reserving space for ".."
-    const ellipsis_w = font.measure("..", size).w;
-    const budget = max_px - ellipsis_w;
-    if (budget <= 0) return "..";
-
-    var w: f32 = 0;
-    var end: usize = 0;
-    while (end < text.len) {
-        const cw = font.measure(text[end .. end + 1], size).w;
-        if (w + cw > budget) break;
-        w += cw;
-        end += 1;
-    }
-    if (end == 0) return "..";
-
-    const truncated = std.fmt.allocPrint(alloc, "{s}..", .{text[0..end]}) catch return text[0..end];
-    return truncated;
-}
-
-fn formatCumulativeTime(alloc: std.mem.Allocator, ns: u64) ![]const u8 {
-    const total_secs = ns / std.time.ns_per_s;
-    if (total_secs >= 3600) {
-        return std.fmt.allocPrint(alloc, "{d}h{d}m", .{ total_secs / 3600, (total_secs % 3600) / 60 });
-    } else if (total_secs >= 60) {
-        return std.fmt.allocPrint(alloc, "{d}m{d}s", .{ total_secs / 60, total_secs % 60 });
-    } else {
-        return std.fmt.allocPrint(alloc, "{d}s", .{total_secs});
-    }
-}
-
-fn formatCpuPercent(alloc: std.mem.Allocator, delta_ns: u64, interval_ns: u64) ![]const u8 {
-    if (delta_ns == 0 or interval_ns == 0) return "0%";
-    // Per-core percentage (like Activity Monitor): 100% = one core fully utilized.
-    // A multi-threaded process can exceed 100% (e.g. 400% = 4 cores maxed).
-    const pct = @as(f64, @floatFromInt(delta_ns)) / @as(f64, @floatFromInt(interval_ns)) * 100.0;
-    if (pct < 0.05) return "0%";
-    if (pct >= 1000.0) {
-        return std.fmt.allocPrint(alloc, "{d:.0}%", .{pct});
-    }
-    if (pct >= 10.0) {
-        return std.fmt.allocPrint(alloc, "{d:.0}%", .{pct});
-    }
-    if (pct >= 1.0) {
-        return std.fmt.allocPrint(alloc, "{d:.1}%", .{pct});
-    }
-    return std.fmt.allocPrint(alloc, "{d:.2}%", .{pct});
-}
-
-fn formatGpuPercent(alloc: std.mem.Allocator, delta_ns: u64, interval_ns: u64) ![]const u8 {
-    if (delta_ns == 0 or interval_ns == 0) return "0%";
-    const pct = @as(f64, @floatFromInt(delta_ns)) / @as(f64, @floatFromInt(interval_ns)) * 100.0;
-    if (pct < 0.1) return "0%";
-    if (pct >= 100.0) return "100%";
-    if (pct >= 10.0) {
-        return std.fmt.allocPrint(alloc, "{d:.0}%", .{pct});
-    }
-    return std.fmt.allocPrint(alloc, "{d:.1}%", .{pct});
-}
-
-fn formatDiskRate(alloc: std.mem.Allocator, delta_bytes: u64, interval_ns: u64) ![]const u8 {
-    if (delta_bytes == 0 or interval_ns == 0) return "0 B/s";
-    const secs = @as(f64, @floatFromInt(interval_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
-    const bytes_per_sec = @as(f64, @floatFromInt(delta_bytes)) / secs;
-    if (bytes_per_sec >= 1024.0 * 1024.0 * 1024.0) {
-        return std.fmt.allocPrint(alloc, "{d:.1}G/s", .{bytes_per_sec / (1024.0 * 1024.0 * 1024.0)});
-    } else if (bytes_per_sec >= 1024.0 * 1024.0) {
-        return std.fmt.allocPrint(alloc, "{d:.1}M/s", .{bytes_per_sec / (1024.0 * 1024.0)});
-    } else if (bytes_per_sec >= 1024.0) {
-        return std.fmt.allocPrint(alloc, "{d:.0}K/s", .{bytes_per_sec / 1024.0});
-    }
-    return "0 B/s";
-}
-
-fn formatRss(alloc: std.mem.Allocator, rss: u64) ![]const u8 {
-    const mb = rss / (1024 * 1024);
-    if (mb > 0) {
-        return std.fmt.allocPrint(alloc, "{d}M", .{mb});
-    }
-    const kb = rss / 1024;
-    return std.fmt.allocPrint(alloc, "{d}K", .{kb});
-}
-
-fn computeSummary(alloc: std.mem.Allocator) layout.SystemSummary {
-    var summary = layout.SystemSummary{};
-    if (!state.has_snapshot) return summary;
-
-    summary.proc_count = state.proc_count;
-
-    var iter = state.proc_map.iterator();
-    while (iter.next()) |entry| {
-        const p = entry.value_ptr.*;
-
-        summary.total_rss += p.mem_rss;
-
-        const cpu_total = p.total_user + p.total_system;
-        const disk_total = p.diskio_bytes_read + p.diskio_bytes_written;
-        insertTop5(&summary.top_cpu, &summary.top_cpu_count, p.name, cpu_total);
-        insertTop5(&summary.top_mem, &summary.top_mem_count, p.name, p.mem_rss);
-        insertTop5(&summary.top_disk, &summary.top_disk_count, p.name, disk_total);
-    }
-
-    // Pre-format value strings for the layout (graph legends use cumulative time)
-    for (summary.top_cpu[0..@intCast(summary.top_cpu_count)]) |*e| {
-        e.value_str = formatCumulativeTime(alloc, e.value) catch "?";
-    }
-    for (summary.top_mem[0..@intCast(summary.top_mem_count)]) |*e| {
-        e.value_str = formatRss(alloc, e.value) catch "?";
-    }
-    for (summary.top_disk[0..@intCast(summary.top_disk_count)]) |*e| {
-        e.value_str = formatRss(alloc, e.value) catch "?";
-    }
-    summary.total_rss_str = formatRss(alloc, summary.total_rss) catch "?";
-
-    // Pre-format strings that layout.zig will pass to clay.text()
-    // These must be arena-allocated so they survive until render commands are consumed.
-    if (state.search_len > 0) {
-        summary.header_stats_str = std.fmt.allocPrint(alloc, "{d}/{d} procs | {s} RSS", .{
-            state.current_display_pids.len,
-            summary.proc_count,
-            summary.total_rss_str,
-        }) catch "?";
-    } else {
-        summary.header_stats_str = std.fmt.allocPrint(alloc, "{d} procs | {s} RSS", .{
-            summary.proc_count,
-            summary.total_rss_str,
-        }) catch "?";
-    }
-
-    summary.mem_title_str = std.fmt.allocPrint(alloc, "Memory ({s} total)", .{
-        summary.total_rss_str,
-    }) catch "Memory";
-
-    // Per-core CPU utilization
-    summary.core_count = @intCast(state.core_count);
-    for (0..state.core_count) |i| {
-        summary.core_utils[i] = state.core_utils[i];
-    }
-
-    return summary;
-}
-
-fn insertTop5(arr: *[5]layout.TopEntry, count: *u8, name: []const u8, value: u64) void {
-    if (value == 0) return;
-
-    const c: usize = @intCast(count.*);
-    if (c < 5) {
-        arr[c] = .{ .name = name, .value = value };
-        count.* += 1;
-        // Bubble into sorted position (descending)
-        var j: usize = c;
-        while (j > 0 and arr[j].value > arr[j - 1].value) {
-            const tmp = arr[j];
-            arr[j] = arr[j - 1];
-            arr[j - 1] = tmp;
-            j -= 1;
-        }
-    } else if (value > arr[4].value) {
-        arr[4] = .{ .name = name, .value = value };
-        var j: usize = 4;
-        while (j > 0 and arr[j].value > arr[j - 1].value) {
-            const tmp = arr[j];
-            arr[j] = arr[j - 1];
-            arr[j - 1] = tmp;
-            j -= 1;
-        }
-    }
 }
 
 export fn cleanup() void {
@@ -1035,6 +720,7 @@ export fn cleanup() void {
     if (state.clay_memory.len > 0) {
         std.heap.page_allocator.free(state.clay_memory);
     }
+    state.display_arena.deinit();
     state.frame_arena.deinit();
     if (state.has_snapshot) {
         state.snapshot_arena.deinit();
@@ -1055,18 +741,31 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 const new_width = @max(state.drag_start_width + delta, 30.0); // min 30px
                 state.col_widths[col_idx] = new_width;
             }
+            // Handle column header reorder drag — activate after threshold
+            if (state.dragging_header != null and !state.header_drag_started) {
+                if (@abs(state.mouse_x - state.header_drag_start_x) >= state.header_drag_threshold) {
+                    state.header_drag_started = true;
+                }
+            }
         },
         .MOUSE_DOWN => {
             if (e.mouse_button == .LEFT) {
                 state.mouse_x = e.mouse_x / dpi;
                 state.mouse_y = e.mouse_y / dpi;
 
-                // Check if clicking a column resize edge
+                // Check if clicking a column resize edge (highest priority)
                 if (hitTestColumnEdge(state.mouse_x, state.mouse_y)) |col_idx| {
                     state.dragging_col = col_idx;
                     state.drag_start_x = state.mouse_x;
                     state.drag_start_width = state.col_widths[col_idx];
                     // Don't set mouse_clicked — this is a resize, not a row click
+                } else if (hitTestColumnHeader(state.mouse_x, state.mouse_y)) |col_idx| {
+                    // Start potential column header drag (activates after threshold)
+                    state.dragging_header = col_idx;
+                    state.header_drag_start_x = state.mouse_x;
+                    state.header_drag_started = false;
+                    // Don't set mouse_clicked — sort is deferred to MOUSE_UP
+                    state.mouse_down = true;
                 } else {
                     state.mouse_down = true;
                     state.mouse_clicked = true;
@@ -1076,6 +775,47 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         },
         .MOUSE_UP => {
             if (e.mouse_button == .LEFT) {
+                if (state.header_drag_started) {
+                    // Finalize column reorder
+                    if (state.dragging_header) |src_col| {
+                        const drop_pos = findDropPosition(state.mouse_x);
+                        // Find current position of the dragged column
+                        var src_pos: u8 = 0;
+                        for (state.col_order, 0..) |c, p| {
+                            if (c == src_col) {
+                                src_pos = @intCast(p);
+                                break;
+                            }
+                        }
+                        if (src_pos != drop_pos) {
+                            // Remove from old position and insert at new position
+                            var new_order: [layout.COL_COUNT]u8 = undefined;
+                            var dst: u8 = 0;
+                            // Copy all except src
+                            for (state.col_order) |c| {
+                                if (c != src_col) {
+                                    new_order[dst] = c;
+                                    dst += 1;
+                                }
+                            }
+                            // Insert src_col at drop_pos (clamped to new length)
+                            const insert_at = @min(drop_pos, layout.COL_COUNT - 1);
+                            // Shift elements right to make room
+                            var j: u8 = layout.COL_COUNT - 1;
+                            while (j > insert_at) : (j -= 1) {
+                                new_order[j] = new_order[j - 1];
+                            }
+                            new_order[insert_at] = src_col;
+                            state.col_order = new_order;
+                        }
+                    }
+                } else if (state.dragging_header != null) {
+                    // Threshold not met — treat as a simple header click (sort)
+                    state.mouse_clicked = true;
+                    state.click_modifiers = e.modifiers;
+                }
+                state.dragging_header = null;
+                state.header_drag_started = false;
                 state.mouse_down = false;
                 state.dragging_col = null;
             }
@@ -1136,7 +876,7 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
 }
 
 /// Test if mouse position is near a column header's right edge (resize handle).
-/// Returns the column index (0-4) if within the resize zone, null otherwise.
+/// Returns the logical column index if within the resize zone, null otherwise.
 fn hitTestColumnEdge(mx: f32, my: f32) ?u8 {
     // Column header area: Y from header + tab bar to + col_header_height
     const header_top = theme.header_height + theme.tab_bar_height;
@@ -1147,19 +887,55 @@ fn hitTestColumnEdge(mx: f32, my: f32) ?u8 {
     const left_pad: f32 = 14.0; // matches row padding.left in layout
 
     var edge_x: f32 = left_pad;
-    for (0..6) |i| {
-        edge_x += state.col_widths[i];
+    for (state.col_order) |col_idx| {
+        if (col_idx == @intFromEnum(layout.Col.path)) continue; // PATH is grow, no resize
+        edge_x += state.col_widths[col_idx];
         if (@abs(mx - edge_x) <= edge_tolerance) {
-            return @intCast(i);
+            return col_idx;
         }
     }
     return null;
 }
 
+/// Test if mouse position is over a column header body (not the resize handle edge).
+/// Returns the logical column index, null if not over any header.
+fn hitTestColumnHeader(mx: f32, my: f32) ?u8 {
+    const header_top = theme.header_height + theme.tab_bar_height;
+    const header_bottom = header_top + theme.col_header_height;
+    if (my < header_top or my > header_bottom) return null;
+
+    // Don't start header drag if we're on a resize edge
+    if (hitTestColumnEdge(mx, my) != null) return null;
+
+    const left_pad: f32 = 14.0;
+    var edge_x: f32 = left_pad;
+    for (state.col_order) |col_idx| {
+        const w: f32 = if (col_idx == @intFromEnum(layout.Col.path)) 9999 else state.col_widths[col_idx];
+        if (mx >= edge_x and mx < edge_x + w) {
+            return col_idx;
+        }
+        edge_x += w;
+    }
+    return null;
+}
+
+/// Find the display position index where a column should be dropped based on mouse X.
+fn findDropPosition(mx: f32) u8 {
+    const left_pad: f32 = 14.0;
+    var edge_x: f32 = left_pad;
+    for (state.col_order, 0..) |col_idx, pos| {
+        const w: f32 = if (col_idx == @intFromEnum(layout.Col.path)) 9999 else state.col_widths[col_idx];
+        const mid = edge_x + w / 2.0;
+        if (mx < mid) return @intCast(pos);
+        edge_x += w;
+    }
+    return layout.COL_COUNT - 1;
+}
+
 const NavDirection = enum { up, down };
 
 fn processKeyNav(dir: NavDirection) void {
-    const pids = state.current_display_pids;
+    const pids = state.materialized_pids;
     if (pids.len == 0) return;
 
     // Find lowest and highest selected display indices
@@ -1282,7 +1058,7 @@ fn processClick() void {
     // Check column header clicks for sorting
     if (processHeaderClick()) return;
 
-    const pids = state.current_display_pids;
+    const pids = state.materialized_pids;
 
     // Find which row was clicked (and its display index)
     var clicked_pid: ?process.pid_t = null;
@@ -1379,7 +1155,10 @@ fn spawnDetailWindow(pid: process.pid_t) void {
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
 
-    const argv = [_][]const u8{ detail_path, pid_str };
+    var theme_buf: [16]u8 = undefined;
+    const theme_str = std.fmt.bufPrint(&theme_buf, "{d}", .{theme.current_theme_index}) catch return;
+
+    const argv = [_][]const u8{ detail_path, pid_str, "--theme", theme_str };
     var child = std.process.Child.init(&argv, std.heap.page_allocator);
     _ = child.spawn() catch |err| {
         print("procz: failed to spawn procz-detail: {}\n", .{err});

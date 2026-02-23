@@ -102,6 +102,7 @@ pub fn build(b: *std.Build) void {
     });
     graph_mod.addImport("sokol", sokol_mod);
     graph_mod.addImport("theme", theme_mod);
+    graph_mod.addImport("font", font_mod);
 
     const renderer_mod = b.createModule(.{
         .root_source_file = b.path("src/ui/renderer.zig"),
@@ -123,9 +124,22 @@ pub fn build(b: *std.Build) void {
     layout_mod.addImport("process", process_mod);
     layout_mod.addImport("theme", theme_mod);
 
+    // -- display module (materialization boundary) --
+    const display_mod = b.createModule(.{
+        .root_source_file = b.path("src/model/display.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    display_mod.addImport("process", process_mod);
+    display_mod.addImport("tree", tree_mod);
+    display_mod.addImport("layout", layout_mod);
+    display_mod.addImport("platform", platform_mod);
+    display_mod.addImport("font", font_mod);
+    display_mod.addImport("theme", theme_mod);
+
     // -- procz main module --
     const main_mod = b.createModule(.{
-        .root_source_file = b.path("cmd/procz/main.zig"),
+        .root_source_file = b.path("src/cmd/procz/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -141,10 +155,11 @@ pub fn build(b: *std.Build) void {
     main_mod.addImport("producer", producer_mod);
     main_mod.addImport("font", font_mod);
     main_mod.addImport("graph", graph_mod);
+    main_mod.addImport("display", display_mod);
 
     // -- procz-detail module --
     const detail_mod = b.createModule(.{
-        .root_source_file = b.path("cmd/procDetail/main.zig"),
+        .root_source_file = b.path("src/cmd/procDetail/main.zig"),
         .target = target,
         .optimize = optimize,
     });

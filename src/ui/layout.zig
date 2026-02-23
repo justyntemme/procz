@@ -70,17 +70,35 @@ pub const SortDirection = enum {
 
 pub const ActiveTab = enum { processes, performance };
 
+/// Logical column indices
+pub const Col = enum(u3) {
+    pid = 0,
+    name = 1,
+    cpu = 2,
+    mem = 3,
+    disk = 4,
+    gpu = 5,
+    path = 6,
+};
+
+pub const COL_COUNT = 7;
+pub const default_col_order: [COL_COUNT]u8 = .{ 0, 1, 2, 3, 4, 5, 6 };
+
 pub const InteractionState = struct {
     is_selected: []const bool, // parallel to row_texts
     hovered_index: ?usize,
     sort_column: SortColumn = .none,
     sort_direction: SortDirection = .descending,
     col_widths: [6]f32 = .{ theme.col_pid, theme.col_name, theme.col_cpu, theme.col_mem, theme.col_disk, theme.col_gpu },
+    col_order: [COL_COUNT]u8 = default_col_order, // display position → logical column index
+    dragging_header: ?u8 = null, // logical column index being dragged for reorder
+    drag_header_x: f32 = 0, // current mouse x during header drag
     search_text: []const u8 = "",
     search_focused: bool = false,
     cursor_visible: bool = true,
     active_tab: ActiveTab = .processes,
     viewport_height: f32 = 600,
+    scroll_y: f32 = 0, // pre-fetched scroll offset for processes tab virtualization
 };
 
 pub const MenuState = struct {
@@ -209,17 +227,27 @@ fn buildSearchBar(interaction: InteractionState) void {
             // Placeholder: "Filter" in placeholderText color
             clay.text("Filter", .{ .color = theme.text_footer, .font_size = 14 });
         } else if (!has_text and focused) {
-            // Focused but empty: show subtle prompt
-            clay.text("Filter processes\xe2\x80\xa6", .{ .color = theme.text_footer, .font_size = 14 });
-            if (interaction.cursor_visible) {
-                clay.text("|", .{ .color = theme.accent, .font_size = 14 });
-            }
+            // Focused but empty: show subtle prompt + tight cursor
+            clay.UI()(.{
+                .id = clay.ElementId.ID("search-inner"),
+                .layout = .{ .direction = .left_to_right, .child_gap = 0 },
+            })({
+                clay.text("Filter processes\xe2\x80\xa6", .{ .color = theme.text_footer, .font_size = 14 });
+                if (interaction.cursor_visible) {
+                    clay.text("|", .{ .color = theme.accent, .font_size = 14 });
+                }
+            });
         } else {
-            // Has text: show typed content
-            clay.text(interaction.search_text, .{ .color = theme.text_primary, .font_size = 14 });
-            if (focused and interaction.cursor_visible) {
-                clay.text("|", .{ .color = theme.accent, .font_size = 14 });
-            }
+            // Has text: show typed content + tight cursor
+            clay.UI()(.{
+                .id = clay.ElementId.ID("search-txt"),
+                .layout = .{ .direction = .left_to_right, .child_gap = 0 },
+            })({
+                clay.text(interaction.search_text, .{ .color = theme.text_primary, .font_size = 14 });
+                if (focused and interaction.cursor_visible) {
+                    clay.text("|", .{ .color = theme.accent, .font_size = 14 });
+                }
+            });
         }
     });
 }
@@ -289,7 +317,7 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
             .direction = .top_to_bottom,
         },
     })({
-        // Column headers
+        // Column headers (order driven by col_order)
         clay.UI()(.{
             .id = clay.ElementId.ID("col-hdr"),
             .layout = .{
@@ -300,18 +328,46 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
             },
             .background_color = theme.col_header_bg,
         })({
-            colHeaderCell("ch-pid", interaction.col_widths[0], "PID", .none, interaction);
-            colHeaderCell("ch-name", interaction.col_widths[1], "NAME", .name, interaction);
-            colHeaderCell("ch-cpu", interaction.col_widths[2], "CPU", .cpu, interaction);
-            colHeaderCell("ch-mem", interaction.col_widths[3], "MEM", .mem, interaction);
-            colHeaderCell("ch-disk", interaction.col_widths[4], "DISK", .disk, interaction);
-            colHeaderCell("ch-gpu", interaction.col_widths[5], "GPU", .gpu, interaction);
-            colHeaderGrow("ch-path", "PATH");
+            for (interaction.col_order) |col_idx| {
+                const col: Col = @enumFromInt(col_idx);
+                const is_dragged = if (interaction.dragging_header) |dh| dh == col_idx else false;
+                const alpha: f32 = if (is_dragged) 120 else 255;
+                switch (col) {
+                    .pid => colHeaderCellAlpha("ch-pid", interaction.col_widths[0], "PID", .none, interaction, alpha),
+                    .name => colHeaderCellAlpha("ch-name", interaction.col_widths[1], "NAME", .name, interaction, alpha),
+                    .cpu => colHeaderCellAlpha("ch-cpu", interaction.col_widths[2], "CPU", .cpu, interaction, alpha),
+                    .mem => colHeaderCellAlpha("ch-mem", interaction.col_widths[3], "MEM", .mem, interaction, alpha),
+                    .disk => colHeaderCellAlpha("ch-disk", interaction.col_widths[4], "DISK", .disk, interaction, alpha),
+                    .gpu => colHeaderCellAlpha("ch-gpu", interaction.col_widths[5], "GPU", .gpu, interaction, alpha),
+                    .path => colHeaderGrow("ch-path", "PATH"),
+                }
+            }
+
+            // Drop indicator: floating accent line at the target drop position
+            if (interaction.dragging_header != null) {
+                // Compute drop X position from mouse X
+                const drop_x = computeDropX(interaction);
+                clay.UI()(.{
+                    .id = clay.ElementId.ID("drop-ind"),
+                    .floating = .{
+                        .attach_to = .to_parent,
+                        .attach_points = .{ .element = .left_top, .parent = .left_top },
+                        .offset = .{ .x = drop_x, .y = 0 },
+                        .z_index = 50,
+                        .pointer_capture_mode = .passthrough,
+                    },
+                    .layout = .{
+                        .sizing = .{ .w = clay.SizingAxis.fixed(2), .h = clay.SizingAxis.fixed(theme.col_header_height) },
+                    },
+                    .background_color = theme.accent,
+                })({});
+            }
         });
 
         // Scrollable row area (virtualized — only visible rows are built)
-        const scroll_offset = clay.getScrollOffset();
-        const scroll_y: f32 = -scroll_offset.y; // positive = scrolled down
+        // scroll_y is pre-fetched via getScrollContainerData in frame()
+        // (getScrollOffset must be called inline with clip config, after clay.UI() opens the element)
+        const scroll_y: f32 = interaction.scroll_y;
         const viewport_h = interaction.viewport_height;
         const total_rows: usize = row_texts.len;
         const total_content_h = @as(f32, @floatFromInt(total_rows)) * theme.row_height;
@@ -336,7 +392,7 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
                 .sizing = clay.Sizing.grow,
                 .direction = .top_to_bottom,
             },
-            .clip = .{ .vertical = true, .child_offset = scroll_offset },
+            .clip = .{ .vertical = true, .child_offset = clay.getScrollOffset() },
         })({
             // Top spacer — represents rows above the visible window
             if (top_spacer_h > 0) {
@@ -365,14 +421,19 @@ fn buildProcessesTab(row_texts: []const RowText, summary: SystemSummary, interac
                     },
                     .background_color = bg_color,
                 })({
-                    cell("pid", i, interaction.col_widths[0], row.pid_str, theme.text_dim);
-                    nameCellDyn(i, row, interaction.col_widths[1]);
                     const i_scale: f32 = if (is_selected) 0.3 else 1.0;
-                    intensityCell("cpu", i, interaction.col_widths[2], row.cpu_str, theme.text_dim, theme.intensity_tint, row.cpu_intensity * i_scale, bg_color);
-                    intensityCell("mem", i, interaction.col_widths[3], row.mem_str, theme.text_dim, theme.intensity_tint, row.mem_intensity * i_scale, bg_color);
-                    intensityCell("dsk", i, interaction.col_widths[4], row.disk_str, theme.text_dim, theme.intensity_tint, row.disk_intensity * i_scale, bg_color);
-                    intensityCell("gpu", i, interaction.col_widths[5], row.gpu_str, theme.text_dim, theme.intensity_tint, row.gpu_intensity * i_scale, bg_color);
-                    pathCell(i, row);
+                    for (interaction.col_order) |col_idx| {
+                        const col: Col = @enumFromInt(col_idx);
+                        switch (col) {
+                            .pid => cell("pid", i, interaction.col_widths[0], row.pid_str, theme.text_dim),
+                            .name => nameCellDyn(i, row, interaction.col_widths[1]),
+                            .cpu => intensityCell("cpu", i, interaction.col_widths[2], row.cpu_str, theme.text_dim, theme.intensity_tint, row.cpu_intensity * i_scale, bg_color),
+                            .mem => intensityCell("mem", i, interaction.col_widths[3], row.mem_str, theme.text_dim, theme.intensity_tint, row.mem_intensity * i_scale, bg_color),
+                            .disk => intensityCell("dsk", i, interaction.col_widths[4], row.disk_str, theme.text_dim, theme.intensity_tint, row.disk_intensity * i_scale, bg_color),
+                            .gpu => intensityCell("gpu", i, interaction.col_widths[5], row.gpu_str, theme.text_dim, theme.intensity_tint, row.gpu_intensity * i_scale, bg_color),
+                            .path => pathCell(i, row),
+                        }
+                    }
                 });
             }
 
@@ -440,7 +501,6 @@ fn buildPerfGraphSection(
         },
         .background_color = theme.graph_section_bg,
         .corner_radius = clay.CornerRadius.all(theme.corner_radius),
-        .clip = .{ .vertical = true },
     })({
         // Title
         clay.text(title, .{ .color = theme.text_header, .font_size = 16 });
@@ -704,6 +764,20 @@ fn buildSettingsPopup() void {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Compute the X offset for the drop indicator (relative to col-hdr bounding box).
+fn computeDropX(interaction: InteractionState) f32 {
+    const mx = interaction.drag_header_x;
+    const left_pad: f32 = 14.0; // matches col-hdr horizontal padding
+    var edge_x: f32 = left_pad;
+    for (interaction.col_order) |col_idx| {
+        const w: f32 = if (col_idx == @intFromEnum(Col.path)) 200 else interaction.col_widths[col_idx];
+        const mid = edge_x + w / 2.0;
+        if (mx < mid) return edge_x;
+        edge_x += w;
+    }
+    return edge_x;
+}
+
 fn colHeaderGrow(comptime id: []const u8, label: []const u8) void {
     clay.UI()(.{
         .id = clay.ElementId.ID(id),
@@ -717,7 +791,12 @@ fn colHeaderGrow(comptime id: []const u8, label: []const u8) void {
 }
 
 fn colHeaderCell(comptime id: []const u8, width: f32, label: []const u8, column: SortColumn, interaction: InteractionState) void {
+    colHeaderCellAlpha(id, width, label, column, interaction, 255);
+}
+
+fn colHeaderCellAlpha(comptime id: []const u8, width: f32, label: []const u8, column: SortColumn, interaction: InteractionState, alpha: f32) void {
     const is_sorted = column != .none and interaction.sort_column == column;
+    const text_color = clay.Color{ theme.text_header[0], theme.text_header[1], theme.text_header[2], alpha };
     clay.UI()(.{
         .id = clay.ElementId.ID(id),
         .layout = .{
@@ -727,24 +806,27 @@ fn colHeaderCell(comptime id: []const u8, width: f32, label: []const u8, column:
             .child_gap = 2,
         },
     })({
-        clay.text(label, .{ .color = theme.text_header, .font_size = 16 });
+        clay.text(label, .{ .color = text_color, .font_size = 16 });
         if (is_sorted) {
             // ▲ U+25B2 = \xe2\x96\xb2, ▼ U+25BC = \xe2\x96\xbc
             const indicator: []const u8 = if (interaction.sort_direction == .ascending) "\xe2\x96\xb2" else "\xe2\x96\xbc";
-            clay.text(indicator, .{ .color = theme.text_header, .font_size = 14 });
+            clay.text(indicator, .{ .color = text_color, .font_size = 14 });
         }
         // Spacer pushes resize handle to right edge
         clay.UI()(.{
             .id = clay.ElementId.ID(id ++ "-sp"),
             .layout = .{ .sizing = .{ .w = clay.SizingAxis.grow } },
         })({});
-        // Resize handle — subtle dot at right edge (Apple-style minimal chrome)
+        // Resize handle — visible bar at right edge, brightens on hover
+        const rh_hovered = clay.pointerOver(clay.ElementId.ID(id ++ "-rh"));
+        const rh_alpha: f32 = if (rh_hovered) 200 else 80;
         clay.UI()(.{
             .id = clay.ElementId.ID(id ++ "-rh"),
             .layout = .{
-                .sizing = .{ .w = clay.SizingAxis.fixed(1), .h = clay.SizingAxis.fixed(12) },
+                .sizing = .{ .w = clay.SizingAxis.fixed(3), .h = clay.SizingAxis.fixed(16) },
             },
-            .background_color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 120 },
+            .background_color = .{ theme.separator[0], theme.separator[1], theme.separator[2], rh_alpha },
+            .corner_radius = clay.CornerRadius.all(1.5),
         })({});
     });
 }

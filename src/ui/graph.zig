@@ -1,6 +1,7 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const theme = @import("theme");
+const font = @import("font");
 
 const sgl = sokol.gl;
 
@@ -225,6 +226,10 @@ fn drawLine(history: *const GraphHistory, line_idx: usize, bounds: Bounds, max_v
 // Per-core CPU sparklines
 // ---------------------------------------------------------------------------
 
+/// Mouse position for spark tooltip hit-testing (set by main each frame).
+pub var mouse_x: f32 = 0;
+pub var mouse_y: f32 = 0;
+
 fn renderSparklines(bounds: Bounds) void {
     const count = spark_core_count;
     if (count == 0 or spark_len < 2) return;
@@ -248,12 +253,21 @@ fn renderSparklines(bounds: Bounds) void {
     const g: u8 = @intFromFloat(tint[1]);
     const b: u8 = @intFromFloat(tint[2]);
 
+    var hovered_core: ?usize = null;
+
     for (0..count) |ci| {
         const col: usize = ci % cols;
         const row: usize = ci / cols;
 
         const sx = bounds.x + @as(f32, @floatFromInt(col)) * (spark_w + gap);
         const sy = bounds.y + @as(f32, @floatFromInt(row)) * (spark_h + gap);
+
+        // Hit-test for tooltip
+        if (mouse_x >= sx and mouse_x < sx + spark_w and
+            mouse_y >= sy and mouse_y < sy + spark_h)
+        {
+            hovered_core = ci;
+        }
 
         // Background for each sparkline cell
         sgl.beginTriangles();
@@ -267,6 +281,35 @@ fn renderSparklines(bounds: Bounds) void {
         sgl.end();
 
         renderOneSparkline(ci, sx, sy, spark_w, spark_h, r, g, b);
+    }
+
+    // Draw tooltip for hovered core
+    if (hovered_core) |ci| {
+        const latest_idx = (spark_head + SPARK_HISTORY - 1) % SPARK_HISTORY;
+        const util = @min(core_data[ci][latest_idx], 1.0) * 100.0;
+        var buf: [32]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "Core {d}: {d:.0}%", .{ ci, util }) catch return;
+
+        const fs: f32 = 13.0;
+        const m = font.measure(label, fs);
+        const pad: f32 = 6.0;
+        const tx = mouse_x + 12;
+        const ty = mouse_y - m.h - pad * 2;
+
+        // Tooltip background
+        const tbg = theme.tooltip_bg;
+        const ttx = theme.tooltip_text;
+        sgl.beginTriangles();
+        sgl.c4b(@intFromFloat(tbg[0]), @intFromFloat(tbg[1]), @intFromFloat(tbg[2]), @intFromFloat(tbg[3]));
+        sgl.v2f(tx, ty);
+        sgl.v2f(tx + m.w + pad * 2, ty);
+        sgl.v2f(tx + m.w + pad * 2, ty + m.h + pad * 2);
+        sgl.v2f(tx, ty);
+        sgl.v2f(tx + m.w + pad * 2, ty + m.h + pad * 2);
+        sgl.v2f(tx, ty + m.h + pad * 2);
+        sgl.end();
+
+        font.drawText(tx + pad, ty + pad, label, fs, @intFromFloat(ttx[0]), @intFromFloat(ttx[1]), @intFromFloat(ttx[2]), @intFromFloat(ttx[3]));
     }
 }
 

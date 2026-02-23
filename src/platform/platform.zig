@@ -50,3 +50,16 @@ pub fn collectSnapshot(arena: std.mem.Allocator) PlatformError!std.AutoHashMap(p
 pub fn collectProcess(arena: std.mem.Allocator, pid: pid_t) ?Proc {
     return impl.collectProcess(arena, pid);
 }
+
+pub const TcpConnection = process.TcpConnection;
+pub const TcpState = process.TcpState;
+
+/// Get resource coalition ID for a process (groups app with its XPC services).
+pub fn getCoalitionId(pid: pid_t) u64 {
+    return impl.getCoalitionId(pid);
+}
+
+/// Collect all TCP connections system-wide. Filter by PID/coalition as needed.
+pub fn collectTcpConnections(arena: std.mem.Allocator) PlatformError![]TcpConnection {
+    return impl.collectTcpConnections(arena);
+}

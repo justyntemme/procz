@@ -13,6 +13,7 @@ const graph = @import("graph");
 const display = @import("display");
 const column_ops = @import("column_ops");
 const font = @import("font");
+const icon_cache = @import("icon_cache");
 
 const builtin = @import("builtin");
 const slog = sokol.log;
@@ -28,6 +29,32 @@ const native_menu = if (builtin.os.tag == .macos) @cImport({
     pub fn check_settings_requested() c_int {
         return 0;
     }
+};
+
+const native_ui = if (builtin.os.tag == .macos) @cImport({
+    @cInclude("macos_window_style.h");
+    @cInclude("macos_dialogs.h");
+    @cInclude("macos_context_menu.h");
+    @cInclude("macos_defaults.h");
+    @cInclude("macos_app_icon.h");
+    @cInclude("macos_clipboard.h");
+}) else struct {
+    pub fn setup_window_style() void {}
+    pub fn is_system_dark_mode() c_int { return 1; }
+    pub fn register_appearance_observer() void {}
+    pub fn check_appearance_changed() c_int { return 0; }
+    pub fn show_kill_confirm(_: c_int, _: [*c]const u8) c_int { return 0; }
+    pub fn show_process_context_menu(_: c_int, _: [*c]const u8) c_int { return 0; }
+    pub fn defaults_set_int(_: [*c]const u8, _: c_int) void {}
+    pub fn defaults_get_int(_: [*c]const u8, default: c_int) c_int { return default; }
+    pub fn defaults_set_float(_: [*c]const u8, _: f32) void {}
+    pub fn defaults_get_float(_: [*c]const u8, default: f32) f32 { return default; }
+    pub fn get_app_icon_rgba(_: c_int, _: [*c]u8, _: c_int) c_int { return 0; }
+    pub fn notify_theme_changed(_: c_int) void {}
+    pub fn register_theme_observer() void {}
+    pub fn check_theme_notification() c_int { return -1; }
+    pub fn clipboard_set_string(_: [*c]const u8, _: c_int) void {}
+    pub fn clipboard_get_string(_: [*c]u8, _: c_int) c_int { return 0; }
 };
 
 const state = struct {
@@ -148,6 +175,9 @@ const state = struct {
     var row_flash_map: std.AutoHashMap(process.pid_t, f32) = undefined;
     var row_flash_inited: bool = false;
 
+    // Right-click context menu (deferred to frame for Clay pointerOver)
+    var right_click_pending: bool = false;
+
     // Snapshot interval tracking for GPU % computation
     var last_snapshot_time_ns: i128 = 0;
     var snapshot_interval_ns: u64 = 2 * std.time.ns_per_s; // default 2s
@@ -241,6 +271,18 @@ export fn init() void {
 
     // Setup native macOS menu bar (replaces sokol's default menu)
     native_menu.setup_native_menu();
+
+    // Apply modern macOS window chrome (transparent titlebar, full-size content)
+    native_ui.setup_window_style();
+
+    // Register for system dark/light mode changes
+    native_ui.register_appearance_observer();
+
+    // Register for cross-process theme sync notifications
+    native_ui.register_theme_observer();
+
+    // Load persisted preferences (theme, column widths)
+    loadPreferences();
 }
 
 /// Fallback: collect a single snapshot on the UI thread (used if threading fails).
@@ -568,6 +610,37 @@ fn materializeIfNeeded() void {
     snapshotViewParams();
 }
 
+/// Load persisted preferences from NSUserDefaults (or no-op on non-macOS).
+fn loadPreferences() void {
+    const saved_theme = native_ui.defaults_get_int("theme", -1);
+    if (saved_theme >= 0 and @as(usize, @intCast(saved_theme)) < theme.theme_count) {
+        theme.applyTheme(@intCast(saved_theme));
+    } else {
+        // First launch: auto-select based on system appearance
+        const is_dark = native_ui.is_system_dark_mode() != 0;
+        theme.applyTheme(if (is_dark) 0 else 4); // Procz Dark or Catppuccin Latte
+    }
+
+    // Load column widths
+    const col_keys = [6][]const u8{ "col_pid", "col_name", "col_cpu", "col_mem", "col_disk", "col_gpu" };
+    const defaults = [6]f32{ theme.col_pid, theme.col_name, theme.col_cpu, theme.col_mem, theme.col_disk, theme.col_gpu };
+    for (col_keys, 0..) |key, i| {
+        const val = native_ui.defaults_get_float(key.ptr, defaults[i]);
+        if (val >= 30.0 and val <= 600.0) state.col_widths[i] = val;
+    }
+}
+
+/// Save current preferences to NSUserDefaults and notify other procz processes.
+fn savePreferences() void {
+    native_ui.defaults_set_int("theme", @intCast(theme.current_theme_index));
+    native_ui.notify_theme_changed(@intCast(theme.current_theme_index));
+
+    const col_keys = [6][]const u8{ "col_pid", "col_name", "col_cpu", "col_mem", "col_disk", "col_gpu" };
+    for (col_keys, 0..) |key, i| {
+        native_ui.defaults_set_float(key.ptr, state.col_widths[i]);
+    }
+}
+
 export fn frame() void {
     // Reset frame arena each frame
     _ = state.frame_arena.reset(.retain_capacity);
@@ -576,6 +649,21 @@ export fn frame() void {
     // Check native menu actions
     if (native_menu.check_settings_requested() != 0) {
         state.settings_open = true;
+    }
+
+    // Check system dark/light mode change — auto-switch theme
+    if (native_ui.check_appearance_changed() != 0) {
+        const is_dark = native_ui.is_system_dark_mode() != 0;
+        theme.applyTheme(if (is_dark) 0 else 4);
+        savePreferences();
+    }
+
+    // Check cross-process theme sync (from another procz instance)
+    {
+        const notified = native_ui.check_theme_notification();
+        if (notified >= 0 and @as(usize, @intCast(notified)) < theme.theme_count) {
+            theme.applyTheme(@intCast(notified));
+        }
     }
 
     // Drain events from producer thread
@@ -794,6 +882,12 @@ export fn frame() void {
         state.mouse_clicked = false;
     }
 
+    // Process right-click context menu
+    if (state.right_click_pending) {
+        state.right_click_pending = false;
+        processRightClick();
+    }
+
     // Update cursor: resize / grab / default
     if (state.dragging_col != null) {
         sapp.setMouseCursor(.RESIZE_EW);
@@ -811,6 +905,9 @@ export fn frame() void {
     graph.mouse_x = state.mouse_x;
     graph.mouse_y = state.mouse_y;
 
+    // Set visible PIDs for icon rendering
+    icon_cache.visible_pids = state.materialized_pids;
+
     // Render
     sg.beginPass(.{
         .action = state.pass_action,
@@ -822,6 +919,9 @@ export fn frame() void {
 }
 
 export fn cleanup() void {
+    // Save preferences before exit
+    savePreferences();
+
     // Signal producer thread to stop
     if (state.thread_handle) |handle| {
         state.thread_running.store(false, .release);
@@ -883,7 +983,11 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
             }
         },
         .MOUSE_DOWN => {
-            if (e.mouse_button == .LEFT) {
+            if (e.mouse_button == .RIGHT) {
+                state.mouse_x = e.mouse_x / dpi;
+                state.mouse_y = e.mouse_y / dpi;
+                state.right_click_pending = true;
+            } else if (e.mouse_button == .LEFT) {
                 state.mouse_x = e.mouse_x / dpi;
                 state.mouse_y = e.mouse_y / dpi;
 
@@ -1035,6 +1139,68 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                         state.selection_start = 0;
                         state.cursor_pos = state.search_len;
                         state.cursor_blink_timer = 0;
+                    }
+                },
+                .C => {
+                    // Cmd+C: copy selected text (or all if no selection) to clipboard
+                    if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0 and state.search_len > 0) {
+                        const text = if (state.selection_start) |ss| blk: {
+                            const lo = @min(ss, state.cursor_pos);
+                            const hi = @max(ss, state.cursor_pos);
+                            break :blk if (lo != hi) state.search_buf[lo..hi] else state.search_buf[0..state.search_len];
+                        } else state.search_buf[0..state.search_len];
+                        native_ui.clipboard_set_string(text.ptr, @intCast(text.len));
+                    }
+                },
+                .V => {
+                    // Cmd+V: paste text from clipboard into search bar
+                    if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0) {
+                        if (state.selection_start != null) deleteSelection();
+                        var paste_buf: [128]u8 = undefined;
+                        const paste_len: usize = @intCast(@max(native_ui.clipboard_get_string(&paste_buf, @intCast(state.search_buf.len - 1 - state.search_len)), 0));
+                        if (paste_len > 0) {
+                            const avail = state.search_buf.len - 1 - state.search_len;
+                            const to_insert = @min(paste_len, avail);
+                            // Shift existing text right
+                            var j: usize = state.search_len + to_insert;
+                            while (j > state.cursor_pos + to_insert) {
+                                j -= 1;
+                                state.search_buf[j] = state.search_buf[j - to_insert];
+                            }
+                            // Insert pasted text (filter to printable ASCII)
+                            var inserted: usize = 0;
+                            for (paste_buf[0..to_insert]) |ch| {
+                                if (ch >= 32 and ch < 127) {
+                                    state.search_buf[state.cursor_pos + inserted] = ch;
+                                    inserted += 1;
+                                }
+                            }
+                            // If we filtered some chars, shift back
+                            if (inserted < to_insert) {
+                                const diff = to_insert - inserted;
+                                var k: usize = state.cursor_pos + inserted;
+                                while (k + diff < state.search_len + to_insert) : (k += 1) {
+                                    state.search_buf[k] = state.search_buf[k + diff];
+                                }
+                            }
+                            state.search_len += inserted;
+                            state.cursor_pos += inserted;
+                            state.cursor_blink_timer = 0;
+                        }
+                    }
+                },
+                .X => {
+                    // Cmd+X: cut selected text to clipboard
+                    if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0 and state.search_len > 0) {
+                        if (state.selection_start) |ss| {
+                            const lo = @min(ss, state.cursor_pos);
+                            const hi = @max(ss, state.cursor_pos);
+                            if (lo != hi) {
+                                native_ui.clipboard_set_string(state.search_buf[lo..hi].ptr, @intCast(hi - lo));
+                                deleteSelection();
+                                state.cursor_blink_timer = 0;
+                            }
+                        }
                     }
                 },
                 .ESCAPE => {
@@ -1213,6 +1379,7 @@ fn processMenuClick() bool {
         for (0..theme.theme_count) |i| {
             if (clay.pointerOver(clay.ElementId.IDI("thm", @intCast(i)))) {
                 theme.applyTheme(i);
+                savePreferences();
                 return true;
             }
         }
@@ -1349,6 +1516,50 @@ fn processClick() void {
         // Clicked outside rows: deselect all
         state.selected_pids.clearRetainingCapacity();
         state.anchor_pid = null;
+    }
+}
+
+/// Handle right-click on a process row — show native context menu.
+fn processRightClick() void {
+    const pids = state.materialized_pids;
+    const rows = state.materialized_rows;
+
+    // Find which row the mouse is over
+    for (pids, 0..) |pid, i| {
+        if (clay.pointerOver(clay.ElementId.IDI("row", @intCast(i)))) {
+            // Get process name (null-terminated for C interop)
+            const name = if (i < rows.len) rows[i].name else "";
+            var name_buf: [256]u8 = undefined;
+            const name_z = std.fmt.bufPrint(&name_buf, "{s}\x00", .{name}) catch return;
+
+            // Show native context menu (blocks until dismissed)
+            const action = native_ui.show_process_context_menu(
+                pid,
+                @ptrCast(name_z.ptr),
+            );
+
+            // Handle returned action
+            if (action == native_ui.CTX_ACTION_KILL) {
+                killProcess(pid, name);
+            } else if (action == native_ui.CTX_ACTION_DETAIL) {
+                spawnDetailWindow(pid);
+            }
+            return;
+        }
+    }
+}
+
+/// Kill a process after native confirmation dialog.
+fn killProcess(pid: process.pid_t, name: []const u8) void {
+    var name_buf: [256]u8 = undefined;
+    const name_z = std.fmt.bufPrint(&name_buf, "{s}\x00", .{name}) catch return;
+
+    if (native_ui.show_kill_confirm(pid, @ptrCast(name_z.ptr)) != 0) {
+        // User confirmed — send SIGTERM
+        const posix_pid: std.posix.pid_t = @intCast(pid);
+        std.posix.kill(posix_pid, std.posix.SIG.TERM) catch |err| {
+            print("procz: kill({d}) failed: {}\n", .{ pid, err });
+        };
     }
 }
 

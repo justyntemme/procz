@@ -19,10 +19,16 @@ const print = std.debug.print;
 const native_menu = if (builtin.os.tag == .macos) @cImport({
     @cInclude("macos_menu.h");
 }) else struct {
-    pub fn setup_native_menu() void {}
-    pub fn check_settings_requested() c_int {
-        return 0;
-    }
+    pub fn setup_detail_menu() void {}
+};
+
+const native_ui = if (builtin.os.tag == .macos) @cImport({
+    @cInclude("macos_window_style.h");
+    @cInclude("macos_defaults.h");
+}) else struct {
+    pub fn setup_window_style() void {}
+    pub fn register_theme_observer() void {}
+    pub fn check_theme_notification() c_int { return -1; }
 };
 
 const DetailTab = enum { overview, network };
@@ -140,7 +146,9 @@ export fn init() void {
     // Collect initial data
     collectData();
 
-    native_menu.setup_native_menu();
+    native_menu.setup_detail_menu();
+    native_ui.setup_window_style();
+    native_ui.register_theme_observer();
 }
 
 fn collectData() void {
@@ -258,6 +266,14 @@ fn clayErrorHandler(err: clay.ErrorData) callconv(.c) void {
 export fn frame() void {
     _ = state.frame_arena.reset(.retain_capacity);
     const frame_alloc = state.frame_arena.allocator();
+
+    // Check cross-process theme sync from main procz window
+    {
+        const notified = native_ui.check_theme_notification();
+        if (notified >= 0 and @as(usize, @intCast(notified)) < theme.theme_count) {
+            theme.applyTheme(@intCast(notified));
+        }
+    }
 
     // Periodic refresh
     const now_ns = std.time.nanoTimestamp();

@@ -938,8 +938,19 @@ fn nameCellDyn(index: usize, row: RowText, width: f32) void {
             .sizing = .{ .w = clay.SizingAxis.fixed(width), .h = clay.SizingAxis.grow },
             .child_alignment = .{ .x = .left, .y = .center },
             .direction = .left_to_right,
+            .child_gap = 6,
         },
     })({
+        // Icon placeholder — 16×16, nearly transparent so Clay emits a
+        // rectangle command that the renderer can match by element ID.
+        clay.UI()(.{
+            .id = clay.ElementId.IDI("ico", @intCast(index)),
+            .layout = .{
+                .sizing = .{ .w = clay.SizingAxis.fixed(16), .h = clay.SizingAxis.fixed(16) },
+            },
+            .background_color = .{ 0, 0, 0, 1 },
+        })({});
+
         if (row.name_prefix.len > 0) {
             clay.text(row.name_prefix, .{ .color = theme.text_dim, .font_size = 16 });
         }
@@ -978,12 +989,13 @@ fn pathCell(index: usize, row: RowText) void {
                     .id = clay.ElementId.IDI("pts" ++ [_]u8{'0' + si}, @intCast(index)),
                     .floating = .{
                         .attach_to = .to_parent,
-                        .attach_points = .{ .element = .left_top, .parent = .left_bottom },
+                        .attach_points = .{ .element = .right_top, .parent = .right_bottom },
                         .offset = .{ .x = sl.ox, .y = 2 + sl.oy },
                         .z_index = sl.z,
                         .pointer_capture_mode = .passthrough,
                     },
                     .layout = .{
+                        .sizing = .{ .w = clay.SizingAxis.fitMinMax(.{ .max = 500 }) },
                         .padding = clay.Padding.axes(6 + @as(u16, @intFromFloat(sl.expand / 2)), 4 + @as(u16, @intFromFloat(sl.expand / 2))),
                     },
                     .background_color = .{ theme.shadow_color[0], theme.shadow_color[1], theme.shadow_color[2], sl.alpha },
@@ -998,12 +1010,13 @@ fn pathCell(index: usize, row: RowText) void {
                 .id = clay.ElementId.IDI("ptt", @intCast(index)),
                 .floating = .{
                     .attach_to = .to_parent,
-                    .attach_points = .{ .element = .left_top, .parent = .left_bottom },
+                    .attach_points = .{ .element = .right_top, .parent = .right_bottom },
                     .offset = .{ .x = 0, .y = 2 },
                     .z_index = 100,
                     .pointer_capture_mode = .passthrough,
                 },
                 .layout = .{
+                    .sizing = .{ .w = clay.SizingAxis.fitMinMax(.{ .max = 500 }) },
                     .padding = clay.Padding.axes(6, 4),
                 },
                 .background_color = theme.tooltip_bg,

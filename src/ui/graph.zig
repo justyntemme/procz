@@ -19,6 +19,9 @@ pub const MAX_TRACKED: usize = 5;
 pub const DataPoint = struct {
     values: [MAX_TRACKED]f32 = [_]f32{0} ** MAX_TRACKED,
     count: u8 = 0,
+    // Per-point process names (rankings change between snapshots)
+    names: [MAX_TRACKED][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** MAX_TRACKED,
+    name_lens: [MAX_TRACKED]u8 = [_]u8{0} ** MAX_TRACKED,
 };
 
 pub const Bounds = struct {
@@ -28,10 +31,17 @@ pub const Bounds = struct {
     h: f32,
 };
 
+pub const ValueKind = enum {
+    cpu_ticks, // Mach absolute time delta → format as ms or µs
+    mem_bytes, // RSS bytes → format as MB/GB
+    disk_bytes, // I/O delta bytes → format as KB/MB/GB
+};
+
 pub const GraphHistory = struct {
     points: [MAX_HISTORY]DataPoint = [_]DataPoint{.{}} ** MAX_HISTORY,
     head: usize = 0,
     len: usize = 0,
+    kind: ValueKind = .cpu_ticks,
 
     // Current legend names (copied into fixed buffers)
     names: [MAX_TRACKED][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** MAX_TRACKED,
@@ -47,6 +57,12 @@ pub const GraphHistory = struct {
         var dp = DataPoint{ .count = count };
         for (0..count) |i| {
             dp.values[i] = values[i];
+            // Copy name into the data point for tooltip lookup
+            const name = names[i];
+            const len: usize = @min(name.len, 31);
+            @memcpy(dp.names[i][0..len], name[0..len]);
+            if (len < 32) dp.names[i][len] = 0;
+            dp.name_lens[i] = @intCast(len);
         }
 
         self.points[self.head] = dp;
@@ -84,9 +100,9 @@ pub const GraphHistory = struct {
 // Module state
 // ---------------------------------------------------------------------------
 
-pub var cpu_history: GraphHistory = .{};
-pub var mem_history: GraphHistory = .{};
-pub var disk_history: GraphHistory = .{};
+pub var cpu_history: GraphHistory = .{ .kind = .cpu_ticks };
+pub var mem_history: GraphHistory = .{ .kind = .mem_bytes };
+pub var disk_history: GraphHistory = .{ .kind = .disk_bytes };
 
 pub var cpu_bounds: ?Bounds = null;
 pub var mem_bounds: ?Bounds = null;
@@ -201,6 +217,157 @@ fn renderGraph(history: *GraphHistory, bounds: Bounds) void {
     while (line_idx > 0) {
         line_idx -= 1;
         drawLine(history, line_idx, bounds, max_val);
+    }
+
+    // Hover tooltip
+    renderGraphTooltip(history, bounds, max_val);
+}
+
+/// Format a raw graph value into a human-readable string with appropriate units.
+fn formatValue(buf: []u8, val: f64, kind: ValueKind) []const u8 {
+    return switch (kind) {
+        .cpu_ticks => blk: {
+            // CPU deltas are nanoseconds of CPU time consumed in ~2s interval
+            const ns = val;
+            if (ns >= 1_000_000_000.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.1} s", .{ns / 1_000_000_000.0}) catch "";
+            } else if (ns >= 1_000_000.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.1} ms", .{ns / 1_000_000.0}) catch "";
+            } else if (ns >= 1_000.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.0} \xc2\xb5s", .{ns / 1_000.0}) catch ""; // µs
+            } else {
+                break :blk std.fmt.bufPrint(buf, "{d:.0} ns", .{ns}) catch "";
+            }
+        },
+        .mem_bytes => blk: {
+            const bytes = val;
+            if (bytes >= 1_073_741_824.0) { // 1 GiB
+                break :blk std.fmt.bufPrint(buf, "{d:.2} GB", .{bytes / 1_073_741_824.0}) catch "";
+            } else if (bytes >= 1_048_576.0) { // 1 MiB
+                break :blk std.fmt.bufPrint(buf, "{d:.1} MB", .{bytes / 1_048_576.0}) catch "";
+            } else if (bytes >= 1_024.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.0} KB", .{bytes / 1_024.0}) catch "";
+            } else {
+                break :blk std.fmt.bufPrint(buf, "{d:.0} B", .{bytes}) catch "";
+            }
+        },
+        .disk_bytes => blk: {
+            // Disk deltas are bytes read+written in ~2s interval
+            const bytes = val;
+            if (bytes >= 1_073_741_824.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.2} GB", .{bytes / 1_073_741_824.0}) catch "";
+            } else if (bytes >= 1_048_576.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.1} MB", .{bytes / 1_048_576.0}) catch "";
+            } else if (bytes >= 1_024.0) {
+                break :blk std.fmt.bufPrint(buf, "{d:.1} KB", .{bytes / 1_024.0}) catch "";
+            } else {
+                break :blk std.fmt.bufPrint(buf, "{d:.0} B", .{bytes}) catch "";
+            }
+        },
+    };
+}
+
+fn renderGraphTooltip(history: *const GraphHistory, bounds: Bounds, max_val: f32) void {
+    // Hit-test: is the mouse within the graph area?
+    if (mouse_x < bounds.x or mouse_x >= bounds.x + bounds.w) return;
+    if (mouse_y < bounds.y or mouse_y >= bounds.y + bounds.h) return;
+    if (history.len < 2) return;
+
+    const n = history.len;
+    const dx = bounds.w / @as(f32, @floatFromInt(MAX_HISTORY - 1));
+    const x_offset = MAX_HISTORY - n;
+
+    // Map mouse X to the nearest data point index in the ring buffer
+    const rel_x = mouse_x - bounds.x;
+    const float_idx = rel_x / dx - @as(f32, @floatFromInt(x_offset));
+    const snapped: usize = @intFromFloat(@max(@min(@round(float_idx), @as(f32, @floatFromInt(n - 1))), 0));
+    const ring_idx = (history.head + MAX_HISTORY - n + snapped) % MAX_HISTORY;
+    const dp = history.points[ring_idx];
+    const dp_count: usize = @intCast(dp.count);
+    if (dp_count == 0) return;
+
+    // Draw vertical crosshair at snapped X
+    const snap_x = bounds.x + dx * @as(f32, @floatFromInt(x_offset + snapped));
+    sgl.beginLines();
+    sgl.c4b(200, 200, 200, 40);
+    sgl.v2f(snap_x, bounds.y);
+    sgl.v2f(snap_x, bounds.y + bounds.h);
+    sgl.end();
+
+    // Measure tooltip size: each line = color dot + name + formatted value
+    const fs: f32 = 12.0;
+    const pad: f32 = 6.0;
+    const line_h: f32 = 16.0;
+    const dot_w: f32 = 8.0 + 4.0; // dot + gap
+
+    var tooltip_w: f32 = 0;
+    var line_bufs: [MAX_TRACKED][64]u8 = undefined;
+    var val_bufs: [MAX_TRACKED][32]u8 = undefined;
+    var line_strs: [MAX_TRACKED][]const u8 = undefined;
+    for (0..dp_count) |j| {
+        const name = dp.names[j][0..dp.name_lens[j]];
+        const val_str = formatValue(&val_bufs[j], @as(f64, dp.values[j]), history.kind);
+        const label = std.fmt.bufPrint(&line_bufs[j], "{s}: {s}", .{ name, val_str }) catch continue;
+        line_strs[j] = label;
+        const m = font.measure(label, fs);
+        if (dot_w + m.w > tooltip_w) tooltip_w = dot_w + m.w;
+    }
+    tooltip_w += pad * 2;
+    const tooltip_h = pad * 2 + @as(f32, @floatFromInt(dp_count)) * line_h;
+
+    // Position tooltip near mouse, clamped to graph bounds
+    var tx = mouse_x + 12;
+    var ty = mouse_y - tooltip_h - 4;
+    if (tx + tooltip_w > bounds.x + bounds.w) tx = mouse_x - tooltip_w - 8;
+    if (ty < bounds.y) ty = bounds.y + 4;
+
+    // Tooltip background
+    const tbg = theme.tooltip_bg;
+    const ttx = theme.tooltip_text;
+    sgl.beginTriangles();
+    sgl.c4b(@intFromFloat(tbg[0]), @intFromFloat(tbg[1]), @intFromFloat(tbg[2]), @intFromFloat(tbg[3]));
+    sgl.v2f(tx, ty);
+    sgl.v2f(tx + tooltip_w, ty);
+    sgl.v2f(tx + tooltip_w, ty + tooltip_h);
+    sgl.v2f(tx, ty);
+    sgl.v2f(tx + tooltip_w, ty + tooltip_h);
+    sgl.v2f(tx, ty + tooltip_h);
+    sgl.end();
+
+    // Draw each line: color dot + text
+    for (0..dp_count) |j| {
+        const ly = ty + pad + @as(f32, @floatFromInt(j)) * line_h;
+        const color = theme.line_colors[j];
+
+        // Color dot
+        sgl.beginTriangles();
+        sgl.c4b(@intFromFloat(color[0]), @intFromFloat(color[1]), @intFromFloat(color[2]), 255);
+        const dx2: f32 = tx + pad;
+        const dy2: f32 = ly + 4.0;
+        sgl.v2f(dx2, dy2);
+        sgl.v2f(dx2 + 6, dy2);
+        sgl.v2f(dx2 + 6, dy2 + 6);
+        sgl.v2f(dx2, dy2);
+        sgl.v2f(dx2 + 6, dy2 + 6);
+        sgl.v2f(dx2, dy2 + 6);
+        sgl.end();
+
+        // Dot indicator on the graph line for this point
+        const nv = @min(dp.values[j] / max_val, 1.0);
+        const dot_gx = snap_x;
+        const dot_gy = bounds.y + bounds.h * (1.0 - nv);
+        sgl.beginTriangles();
+        sgl.c4b(@intFromFloat(color[0]), @intFromFloat(color[1]), @intFromFloat(color[2]), 255);
+        const dr: f32 = 3.0;
+        sgl.v2f(dot_gx - dr, dot_gy - dr);
+        sgl.v2f(dot_gx + dr, dot_gy - dr);
+        sgl.v2f(dot_gx + dr, dot_gy + dr);
+        sgl.v2f(dot_gx - dr, dot_gy - dr);
+        sgl.v2f(dot_gx + dr, dot_gy + dr);
+        sgl.v2f(dot_gx - dr, dot_gy + dr);
+        sgl.end();
+
+        font.drawText(tx + pad + dot_w, ly, line_strs[j], fs, @intFromFloat(ttx[0]), @intFromFloat(ttx[1]), @intFromFloat(ttx[2]), @intFromFloat(ttx[3]));
     }
 }
 

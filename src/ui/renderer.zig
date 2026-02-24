@@ -4,6 +4,7 @@ const clay = @import("zclay");
 const theme = @import("theme");
 const font = @import("font");
 const graph = @import("graph");
+const icon_cache = @import("icon_cache");
 
 const slog = sokol.log;
 const sg = sokol.gfx;
@@ -29,9 +30,11 @@ pub fn setup() void {
     });
 
     font.init();
+    icon_cache.init();
 }
 
 pub fn shutdown() void {
+    icon_cache.shutdown();
     font.shutdown();
     sgl.shutdown();
 }
@@ -92,6 +95,9 @@ pub fn render(commands: []const clay.RenderCommand) void {
             else => {},
         }
     }
+
+    // Render app icons at "ico" element positions
+    renderIcons(commands);
 
     // Render graph line overlays on top of Clay elements
     graph.renderAll();
@@ -270,4 +276,80 @@ fn renderBorder(cmd: clay.RenderCommand) void {
     }
 
     sgl.end();
+}
+
+// ---------------------------------------------------------------------------
+// App icon rendering pass
+// ---------------------------------------------------------------------------
+
+fn renderIcons(commands: []const clay.RenderCommand) void {
+    const pids = icon_cache.visible_pids;
+    if (pids.len == 0) return;
+
+    // Find the scroll container's scissor region from the command stream.
+    // The "scroll" element (process list) emits a scissor_start that defines
+    // the visible area. We capture it so icons are clipped to the scroll area.
+    var scroll_clip: ?struct { x: f32, y: f32, w: f32, h: f32 } = null;
+    const scroll_id = clay.ElementId.ID("scroll").id;
+    for (commands) |cmd| {
+        if (cmd.command_type == .scissor_start and cmd.id == scroll_id) {
+            scroll_clip = .{
+                .x = cmd.bounding_box.x,
+                .y = cmd.bounding_box.y,
+                .w = cmd.bounding_box.width,
+                .h = cmd.bounding_box.height,
+            };
+            break;
+        }
+    }
+
+    // No scroll container found — likely on performance tab, skip icons
+    const sc = scroll_clip orelse return;
+
+    // Apply scissor to clip icons to the scroll area
+    sgl.scissorRectf(
+        sc.x * dpi_scale,
+        sc.y * dpi_scale,
+        sc.w * dpi_scale,
+        sc.h * dpi_scale,
+        true,
+    );
+
+    // Build a lookup map: element ID → PID index.
+    // Due to row virtualization, only ~30 rows have Clay elements at a time,
+    // but their indices span the full materialized array (e.g. 200..230).
+    // We pre-compute all IDI("ico", i) hashes for the full pid list (up to 2048).
+    const max_rows: usize = @min(pids.len, 2048);
+    var id_map: [2048]u32 = undefined;
+    for (0..max_rows) |i| {
+        id_map[i] = clay.ElementId.IDI("ico", @intCast(i)).id;
+    }
+
+    // Scan commands for icon elements (16×16 rects)
+    for (commands) |cmd| {
+        if (cmd.command_type != .rectangle) continue;
+        const bb = cmd.bounding_box;
+        // Quick size filter: icon elements are exactly 16×16
+        if (bb.width < 15.5 or bb.width > 16.5 or bb.height < 15.5 or bb.height > 16.5) continue;
+
+        // Clip test against scroll area
+        if (bb.y + bb.height <= sc.y or bb.y >= sc.y + sc.h) continue;
+
+        // Match against pre-computed IDs
+        for (id_map[0..max_rows], 0..) |expected_id, idx| {
+            if (cmd.id == expected_id) {
+                const pid = pids[idx];
+                if (icon_cache.getOrLoad(pid)) |uv| {
+                    icon_cache.drawIcon(bb.x, bb.y, bb.width, bb.height, uv);
+                }
+                break;
+            }
+        }
+    }
+
+    // Upload any newly loaded icons to GPU
+    icon_cache.flush();
+
+    // Reset scissor to full viewport
+    sgl.scissorRectf(0, 0, frame_w * dpi_scale, frame_h * dpi_scale, true);
 }

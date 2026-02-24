@@ -99,6 +99,47 @@ void setup_native_menu(void) {
     [[NSApplication sharedApplication] setMainMenu:mainMenu];
 }
 
+void setup_detail_menu(void) {
+    NSMenu *mainMenu = [[NSMenu alloc] init];
+
+    // ---- App menu (minimal — no Settings) ----
+    NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"procz-detail"];
+
+    [appMenu addItemWithTitle:@"About procz"
+                       action:@selector(orderFrontStandardAboutPanel:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    [appMenu addItemWithTitle:@"Hide procz-detail"
+                       action:@selector(hide:)
+                keyEquivalent:@"h"];
+    [appMenu addItemWithTitle:@"Hide Others"
+                       action:@selector(hideOtherApplications:)
+                keyEquivalent:@""];
+    [appMenu addItemWithTitle:@"Show All"
+                       action:@selector(unhideAllApplications:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    [appMenu addItemWithTitle:@"Quit procz-detail"
+                       action:@selector(terminate:)
+                keyEquivalent:@"q"];
+
+    [appMenuItem setSubmenu:appMenu];
+    [mainMenu addItem:appMenuItem];
+
+    // ---- File menu (Close Window only) ----
+    NSMenuItem *fileMenuItem = [[NSMenuItem alloc] init];
+    NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    [fileMenu addItemWithTitle:@"Close Window"
+                        action:@selector(performClose:)
+                 keyEquivalent:@"w"];
+    [fileMenuItem setSubmenu:fileMenu];
+    [mainMenu addItem:fileMenuItem];
+
+    [[NSApplication sharedApplication] setMainMenu:mainMenu];
+}
+
 int check_settings_requested(void) {
     int val = _settings_requested;
     if (val) _settings_requested = 0;

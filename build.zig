@@ -104,6 +104,35 @@ pub fn build(b: *std.Build) void {
     graph_mod.addImport("theme", theme_mod);
     graph_mod.addImport("font", font_mod);
 
+    const scrollbar_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui/scrollbar.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scrollbar_mod.addImport("sokol", sokol_mod);
+    scrollbar_mod.addImport("zclay", zclay_mod);
+    scrollbar_mod.addImport("theme", theme_mod);
+
+    const text_select_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui/text_select.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    text_select_mod.addImport("font", font_mod);
+
+    const column_ops_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui/column_ops.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const icon_cache_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui/icon_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    icon_cache_mod.addImport("sokol", sokol_mod);
+
     const renderer_mod = b.createModule(.{
         .root_source_file = b.path("src/ui/renderer.zig"),
         .target = target,
@@ -114,6 +143,8 @@ pub fn build(b: *std.Build) void {
     renderer_mod.addImport("theme", theme_mod);
     renderer_mod.addImport("font", font_mod);
     renderer_mod.addImport("graph", graph_mod);
+    renderer_mod.addImport("scrollbar", scrollbar_mod);
+    renderer_mod.addImport("icon_cache", icon_cache_mod);
 
     const layout_mod = b.createModule(.{
         .root_source_file = b.path("src/ui/layout.zig"),
@@ -123,6 +154,7 @@ pub fn build(b: *std.Build) void {
     layout_mod.addImport("zclay", zclay_mod);
     layout_mod.addImport("process", process_mod);
     layout_mod.addImport("theme", theme_mod);
+    layout_mod.addImport("column_ops", column_ops_mod);
 
     // -- display module (materialization boundary) --
     const display_mod = b.createModule(.{
@@ -156,6 +188,10 @@ pub fn build(b: *std.Build) void {
     main_mod.addImport("font", font_mod);
     main_mod.addImport("graph", graph_mod);
     main_mod.addImport("display", display_mod);
+    main_mod.addImport("column_ops", column_ops_mod);
+    main_mod.addImport("text_select", text_select_mod);
+    main_mod.addImport("icon_cache", icon_cache_mod);
+    main_mod.addImport("scrollbar", scrollbar_mod);
 
     // -- procz-detail module --
     const detail_mod = b.createModule(.{
@@ -171,6 +207,9 @@ pub fn build(b: *std.Build) void {
     detail_mod.addImport("renderer", renderer_mod);
     detail_mod.addImport("font", font_mod);
     detail_mod.addImport("graph", graph_mod);
+    detail_mod.addImport("column_ops", column_ops_mod);
+    detail_mod.addImport("text_select", text_select_mod);
+    detail_mod.addImport("scrollbar", scrollbar_mod);
 
     // -- macOS native menu (Objective-C) and GPU monitor (C/IOKit) --
     if (target.result.os.tag == .macos) {
@@ -190,6 +229,52 @@ pub fn build(b: *std.Build) void {
         menu_mod.addIncludePath(b.path("src/platform"));
         menu_mod.link_libc = true;
 
+        // Native UI: window style, dialogs, context menus, defaults, app icons
+        const native_ui_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        const native_ui_lib = b.addLibrary(.{
+            .name = "native_ui",
+            .linkage = .static,
+            .root_module = native_ui_mod,
+        });
+        const objc_flags = &[_][]const u8{"-fobjc-arc"};
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_window_style.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_dialogs.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_context_menu.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_defaults.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_app_icon.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_clipboard.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_dropdown.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_startup.m"),
+            .flags = objc_flags,
+        });
+        native_ui_mod.addIncludePath(b.path("src/platform"));
+        native_ui_mod.link_libc = true;
+
         // GPU usage collector via IOKit
         const gpu_mod = b.createModule(.{
             .target = target,
@@ -207,15 +292,22 @@ pub fn build(b: *std.Build) void {
         gpu_mod.addIncludePath(b.path("src/platform"));
         gpu_mod.link_libc = true;
 
-        // Link native menu into both binaries
+        // Link native menu + native UI into both binaries
         main_mod.linkLibrary(menu_lib);
+        main_mod.linkLibrary(native_ui_lib);
         main_mod.addIncludePath(b.path("src/platform"));
 
         detail_mod.linkLibrary(menu_lib);
+        detail_mod.linkLibrary(native_ui_lib);
         detail_mod.addIncludePath(b.path("src/platform"));
 
-        // Link GPU lib into platform module so macos.zig can @cImport the header
+        // Link native_ui_lib into icon_cache for get_app_icon_rgba
+        icon_cache_mod.linkLibrary(native_ui_lib);
+        icon_cache_mod.addIncludePath(b.path("src/platform"));
+
+        // Link GPU lib and native_ui_lib into platform module so macos.zig can @cImport the headers
         platform_mod.linkLibrary(gpu_lib);
+        platform_mod.linkLibrary(native_ui_lib);
         platform_mod.addIncludePath(b.path("src/platform"));
     }
 
@@ -235,10 +327,12 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("proc");
         exe.linkFramework("IOKit");
         exe.linkFramework("CoreFoundation");
+        exe.linkFramework("ServiceManagement");
 
         detail_exe.linkSystemLibrary("proc");
         detail_exe.linkFramework("IOKit");
         detail_exe.linkFramework("CoreFoundation");
+        detail_exe.linkFramework("ServiceManagement");
     }
 
     b.installArtifact(exe);

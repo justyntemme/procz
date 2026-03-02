@@ -51,6 +51,9 @@ pub const GraphHistory = struct {
     // Lerped display values for smooth animation of the latest data point
     display_latest: [MAX_TRACKED]f32 = [_]f32{0} ** MAX_TRACKED,
 
+    // Cached max value across all history points (recomputed on push)
+    cached_max: f32 = 0.001,
+
     pub fn push(self: *GraphHistory, values: []const f32, names: []const []const u8) void {
         const count: u8 = @intCast(@min(values.len, MAX_TRACKED));
 
@@ -78,6 +81,22 @@ pub const GraphHistory = struct {
             if (len < 32) self.names[i][len] = 0;
             self.name_lens[i] = @intCast(len);
         }
+
+        self.recomputeMax();
+    }
+
+    fn recomputeMax(self: *GraphHistory) void {
+        var max_val: f32 = 0.001;
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            const idx = (self.head + MAX_HISTORY - self.len + i) % MAX_HISTORY;
+            const dp = self.points[idx];
+            const dp_count: usize = @intCast(dp.count);
+            for (0..dp_count) |j| {
+                if (dp.values[j] > max_val) max_val = dp.values[j];
+            }
+        }
+        self.cached_max = max_val;
     }
 
     pub fn lerpDisplay(self: *GraphHistory) void {
@@ -86,7 +105,12 @@ pub const GraphHistory = struct {
         const dp = self.points[latest];
         const dp_count: usize = @intCast(dp.count);
         for (0..dp_count) |i| {
-            self.display_latest[i] += (dp.values[i] - self.display_latest[i]) * 0.15;
+            const diff = dp.values[i] - self.display_latest[i];
+            if (@abs(diff) < 0.001) {
+                self.display_latest[i] = dp.values[i];
+            } else {
+                self.display_latest[i] += diff * 0.15;
+            }
         }
     }
 
@@ -113,6 +137,43 @@ pub var disk_bounds: ?Bounds = null;
 pub var clip_bounds: ?Bounds = null;
 
 // ---------------------------------------------------------------------------
+// Bidirectional network graph data
+// ---------------------------------------------------------------------------
+
+pub const NetGraphHistory = struct {
+    in_points: [MAX_HISTORY]f32 = [_]f32{0} ** MAX_HISTORY,
+    out_points: [MAX_HISTORY]f32 = [_]f32{0} ** MAX_HISTORY,
+    head: usize = 0,
+    len: usize = 0,
+    cached_max: f32 = 0.001, // max of both in and out
+
+    pub fn push(self: *NetGraphHistory, in_val: f32, out_val: f32) void {
+        self.in_points[self.head] = in_val;
+        self.out_points[self.head] = out_val;
+        self.head = (self.head + 1) % MAX_HISTORY;
+        if (self.len < MAX_HISTORY) self.len += 1;
+        self.recomputeMax();
+    }
+
+    fn recomputeMax(self: *NetGraphHistory) void {
+        var max_val: f32 = 0.001;
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            const idx = (self.head + MAX_HISTORY - self.len + i) % MAX_HISTORY;
+            if (self.in_points[idx] > max_val) max_val = self.in_points[idx];
+            if (self.out_points[idx] > max_val) max_val = self.out_points[idx];
+        }
+        self.cached_max = max_val;
+    }
+};
+
+pub var net_packets_history: NetGraphHistory = .{};
+pub var net_bytes_history: NetGraphHistory = .{};
+pub var net_graph_bounds: ?Bounds = null;
+/// 0 = packets, 1 = data (bytes)
+pub var net_chart_mode: u8 = 0;
+
+// ---------------------------------------------------------------------------
 // Per-core CPU sparkline data
 // ---------------------------------------------------------------------------
 
@@ -132,7 +193,12 @@ pub fn lerpCoreDisplay() void {
     if (spark_len == 0) return;
     const latest = (spark_head + SPARK_HISTORY - 1) % SPARK_HISTORY;
     for (0..spark_core_count) |c| {
-        display_utils[c] += (core_data[c][latest] - display_utils[c]) * 0.15;
+        const diff = core_data[c][latest] - display_utils[c];
+        if (@abs(diff) < 0.001) {
+            display_utils[c] = core_data[c][latest];
+        } else {
+            display_utils[c] += diff * 0.15;
+        }
     }
 }
 
@@ -167,6 +233,7 @@ pub fn renderAll() void {
     if (mem_bounds) |b| renderGraph(&mem_history, b);
     if (disk_bounds) |b| renderGraph(&disk_history, b);
     if (spark_bounds) |b| renderSparklines(b);
+    if (net_graph_bounds) |b| renderBidirectionalGraph(b);
 
     // Reset scissor to full viewport
     if (clip_bounds != null) {
@@ -195,19 +262,8 @@ fn renderGraph(history: *GraphHistory, bounds: Bounds) void {
         history.points[latest].values[j] = saved[j];
     };
 
-    // Auto-scale: find max value across all visible points
-    var max_val: f32 = 0.001; // avoid division by zero
-    {
-        var i: usize = 0;
-        while (i < history.len) : (i += 1) {
-            const idx = (history.head + MAX_HISTORY - history.len + i) % MAX_HISTORY;
-            const dp = history.points[idx];
-            const dp_count: usize = @intCast(dp.count);
-            for (0..dp_count) |j| {
-                if (dp.values[j] > max_val) max_val = dp.values[j];
-            }
-        }
-    }
+    // Auto-scale: use cached max from last push() call
+    const max_val = history.cached_max;
 
     // Grid lines (subtle horizontal guides at 25%, 50%, 75%)
     drawGrid(bounds);
@@ -441,6 +497,110 @@ fn drawLine(history: *const GraphHistory, line_idx: usize, bounds: Bounds, max_v
 
         sgl.v2f(px0, py0);
         sgl.v2f(px1, py1);
+    }
+    sgl.end();
+}
+
+// ---------------------------------------------------------------------------
+// Bidirectional network graph rendering
+// ---------------------------------------------------------------------------
+
+fn renderBidirectionalGraph(bounds: Bounds) void {
+    const history = if (net_chart_mode == 0) &net_packets_history else &net_bytes_history;
+    if (history.len < 2) return;
+
+    const max_val = history.cached_max;
+    const n = history.len;
+    const dx = bounds.w / @as(f32, @floatFromInt(MAX_HISTORY - 1));
+    const x_offset = MAX_HISTORY - n;
+    const center_y = bounds.y + bounds.h / 2.0;
+    const half_h = bounds.h / 2.0;
+
+    // Center line
+    sgl.beginLines();
+    sgl.c4b(128, 128, 128, 40);
+    sgl.v2f(bounds.x, center_y);
+    sgl.v2f(bounds.x + bounds.w, center_y);
+    sgl.end();
+
+    // Grid lines at 50% of each half
+    sgl.beginLines();
+    sgl.c4b(128, 128, 128, 15);
+    sgl.v2f(bounds.x, center_y - half_h * 0.5);
+    sgl.v2f(bounds.x + bounds.w, center_y - half_h * 0.5);
+    sgl.v2f(bounds.x, center_y + half_h * 0.5);
+    sgl.v2f(bounds.x + bounds.w, center_y + half_h * 0.5);
+    sgl.end();
+
+    // "In" fill (upper half, blue-green)
+    sgl.beginTriangles();
+    sgl.c4b(80, 200, 160, 25);
+    for (0..n - 1) |i| {
+        const idx0 = (history.head + MAX_HISTORY - n + i) % MAX_HISTORY;
+        const idx1 = (history.head + MAX_HISTORY - n + i + 1) % MAX_HISTORY;
+        const v0 = @min(history.in_points[idx0] / max_val, 1.0);
+        const v1 = @min(history.in_points[idx1] / max_val, 1.0);
+        const px0 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i));
+        const px1 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i + 1));
+        const py0 = center_y - half_h * v0;
+        const py1 = center_y - half_h * v1;
+        sgl.v2f(px0, py0);
+        sgl.v2f(px1, py1);
+        sgl.v2f(px1, center_y);
+        sgl.v2f(px0, py0);
+        sgl.v2f(px1, center_y);
+        sgl.v2f(px0, center_y);
+    }
+    sgl.end();
+
+    // "In" line stroke
+    sgl.beginLines();
+    sgl.c4b(80, 200, 160, 230);
+    for (0..n - 1) |i| {
+        const idx0 = (history.head + MAX_HISTORY - n + i) % MAX_HISTORY;
+        const idx1 = (history.head + MAX_HISTORY - n + i + 1) % MAX_HISTORY;
+        const v0 = @min(history.in_points[idx0] / max_val, 1.0);
+        const v1 = @min(history.in_points[idx1] / max_val, 1.0);
+        const px0 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i));
+        const px1 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i + 1));
+        sgl.v2f(px0, center_y - half_h * v0);
+        sgl.v2f(px1, center_y - half_h * v1);
+    }
+    sgl.end();
+
+    // "Out" fill (lower half, orange-red)
+    sgl.beginTriangles();
+    sgl.c4b(220, 140, 80, 25);
+    for (0..n - 1) |i| {
+        const idx0 = (history.head + MAX_HISTORY - n + i) % MAX_HISTORY;
+        const idx1 = (history.head + MAX_HISTORY - n + i + 1) % MAX_HISTORY;
+        const v0 = @min(history.out_points[idx0] / max_val, 1.0);
+        const v1 = @min(history.out_points[idx1] / max_val, 1.0);
+        const px0 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i));
+        const px1 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i + 1));
+        const py0 = center_y + half_h * v0;
+        const py1 = center_y + half_h * v1;
+        sgl.v2f(px0, center_y);
+        sgl.v2f(px1, center_y);
+        sgl.v2f(px1, py1);
+        sgl.v2f(px0, center_y);
+        sgl.v2f(px1, py1);
+        sgl.v2f(px0, py0);
+    }
+    sgl.end();
+
+    // "Out" line stroke
+    sgl.beginLines();
+    sgl.c4b(220, 140, 80, 230);
+    for (0..n - 1) |i| {
+        const idx0 = (history.head + MAX_HISTORY - n + i) % MAX_HISTORY;
+        const idx1 = (history.head + MAX_HISTORY - n + i + 1) % MAX_HISTORY;
+        const v0 = @min(history.out_points[idx0] / max_val, 1.0);
+        const v1 = @min(history.out_points[idx1] / max_val, 1.0);
+        const px0 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i));
+        const px1 = bounds.x + dx * @as(f32, @floatFromInt(x_offset + i + 1));
+        sgl.v2f(px0, center_y + half_h * v0);
+        sgl.v2f(px1, center_y + half_h * v1);
     }
     sgl.end();
 }

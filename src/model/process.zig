@@ -28,9 +28,48 @@ pub const Proc = struct {
     start_time_ns: i128 = 0,
 };
 
+pub const ProcessArgs = struct {
+    argv: []const []const u8,
+    environ: []const []const u8,
+};
+
+pub const StartupItem = struct {
+    label: []const u8,
+    program: []const u8,
+    pid: ?pid_t,
+    run_at_load: bool,
+    keep_alive: bool,
+    is_user_agent: bool, // true=agent, false=daemon
+};
+
 // ---------------------------------------------------------------------------
 // TCP connection types (for procz-detail network tab)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Security info types (for procz-detail security tab)
+// ---------------------------------------------------------------------------
+
+pub const Entitlement = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const SecurityInfo = struct {
+    is_sandboxed: bool = false,
+    code_sign_id: []const u8 = "",
+    team_id: []const u8 = "",
+    signing_authority: []const u8 = "",
+    format: []const u8 = "",
+    entitlements: []const Entitlement = &.{},
+};
+
+pub const NetworkStats = struct {
+    packets_in: u64 = 0,
+    packets_out: u64 = 0,
+    bytes_in: u64 = 0,
+    bytes_out: u64 = 0,
+};
 
 pub const TcpState = enum {
     closed,

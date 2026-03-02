@@ -11,6 +11,7 @@ pub const Batch = struct {
     arena: std.heap.ArenaAllocator,
     map: std.AutoHashMap(_pid_t, _Proc),
     timestamp_ns: i128,
+    startup_items: []const process.StartupItem = &.{},
 
     pub fn deinit(self: *Batch) void {
         // map internals allocated from arena — no separate map.deinit needed

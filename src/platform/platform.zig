@@ -51,8 +51,25 @@ pub fn collectProcess(arena: std.mem.Allocator, pid: pid_t) ?Proc {
     return impl.collectProcess(arena, pid);
 }
 
+pub const ProcessArgs = process.ProcessArgs;
+pub const StartupItem = process.StartupItem;
+
+/// Collect command-line arguments and environment variables for a PID.
+/// Returns null if the process isn't accessible.
+pub fn collectProcessArgs(arena: std.mem.Allocator, pid: pid_t) ?ProcessArgs {
+    return impl.collectProcessArgs(arena, pid);
+}
+
+/// Collect all loaded LaunchAgents/LaunchDaemons.
+pub fn collectStartupItems(arena: std.mem.Allocator) []StartupItem {
+    return impl.collectStartupItems(arena);
+}
+
 pub const TcpConnection = process.TcpConnection;
 pub const TcpState = process.TcpState;
+pub const SecurityInfo = process.SecurityInfo;
+pub const Entitlement = process.Entitlement;
+pub const NetworkStats = process.NetworkStats;
 
 /// Get resource coalition ID for a process (groups app with its XPC services).
 pub fn getCoalitionId(pid: pid_t) u64 {
@@ -62,4 +79,14 @@ pub fn getCoalitionId(pid: pid_t) u64 {
 /// Collect all TCP connections system-wide. Filter by PID/coalition as needed.
 pub fn collectTcpConnections(arena: std.mem.Allocator) PlatformError![]TcpConnection {
     return impl.collectTcpConnections(arena);
+}
+
+/// Collect code signing and entitlement information for a process.
+pub fn collectSecurityInfo(arena: std.mem.Allocator, pid: pid_t) ?SecurityInfo {
+    return impl.collectSecurityInfo(arena, pid);
+}
+
+/// Collect system-wide network interface statistics (cumulative counters).
+pub fn collectNetworkStats() NetworkStats {
+    return impl.collectNetworkStats();
 }

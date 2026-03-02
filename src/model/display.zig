@@ -24,6 +24,9 @@ const TreeEntry = struct {
     cpu_delta: u64 = 0,
     disk_delta: u64 = 0,
     gpu_delta: u64 = 0,
+    is_parent: bool = false,
+    is_expanded: bool = true,
+    search_match: bool = true, // false = ancestor shown for tree context
 };
 
 const SortContext = struct {
@@ -51,6 +54,9 @@ pub const MaterializeParams = struct {
     total_memory: u64,
     proc_count: usize,
     core_utils: []const f32,
+    collapsed_pids: ?*const std.AutoHashMap(process.pid_t, void) = null,
+    tree_adj: ?*const tree.Adjacency = null,
+    tree_pid_to_index: ?*const std.AutoHashMap(process.pid_t, u32) = null,
 };
 
 pub const MaterializedResult = struct {
@@ -76,15 +82,51 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
         };
     }
 
-    // Filter out exited PIDs and attach deltas
+    const has_search = params.search_text.len > 0;
+
+    // Filter out exited PIDs, collapsed subtrees, and attach deltas.
+    // When searching: skip collapse filtering so collapsed children are searchable.
     var filtered: std.ArrayListUnmanaged(TreeEntry) = .empty;
     try filtered.ensureTotalCapacity(alloc, params.rows.len);
 
+    var skip_depth: ?u16 = null; // skip children at depth > this
     for (params.rows) |row| {
         const pid = params.tree_pids[row.index];
+
+        // Handle collapsed subtree skipping (only when NOT searching)
+        if (!has_search) {
+            if (skip_depth) |sd| {
+                if (row.depth > sd) continue;
+                skip_depth = null;
+            }
+        }
+
         if (params.exited_pids.contains(pid)) continue;
         const p = params.proc_map.get(pid) orelse continue;
         const d = params.delta_map.get(pid) orelse DeltaEntry{};
+
+        // Check if this node has children (is_parent) using tree adjacency
+        var has_children = false;
+        if (params.tree_adj) |adj| {
+            if (params.tree_pid_to_index) |pid_map| {
+                if (pid_map.get(pid)) |idx| {
+                    has_children = adj.childrenOf(idx).len > 0;
+                }
+            }
+        }
+
+        // Check if this node is collapsed (ignored during search)
+        const is_collapsed = if (!has_search)
+            (if (params.collapsed_pids) |cp| cp.contains(pid) else false)
+        else
+            false;
+        const is_expanded = !is_collapsed;
+
+        // If collapsed, skip all descendants
+        if (!has_search and is_collapsed and has_children) {
+            skip_depth = row.depth;
+        }
+
         filtered.appendAssumeCapacity(.{
             .pid = pid,
             .proc_data = p,
@@ -92,32 +134,61 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
             .cpu_delta = d.cpu,
             .disk_delta = d.disk,
             .gpu_delta = d.gpu,
+            .is_parent = has_children,
+            .is_expanded = is_expanded,
         });
     }
 
-    // Search filter
-    const has_search = params.search_text.len > 0;
+    // Search filter — preserve tree hierarchy by keeping matches + their ancestors
     if (has_search) {
-        var w: usize = 0;
+        // Pass 1: find PIDs that directly match the search
+        var match_set: std.AutoHashMapUnmanaged(process.pid_t, void) = .empty;
+        try match_set.ensureTotalCapacity(alloc, @intCast(@min(filtered.items.len, 512)));
         for (filtered.items) |entry| {
             if (caseInsensitiveContains(entry.proc_data.name, params.search_text) or
                 caseInsensitiveContains(entry.proc_data.path, params.search_text))
             {
-                filtered.items[w] = entry;
+                match_set.put(alloc, entry.pid, {}) catch {};
+            }
+        }
+
+        // Pass 2: walk ancestor chains from each match to build ancestor set
+        var ancestor_set: std.AutoHashMapUnmanaged(process.pid_t, void) = .empty;
+        var match_iter = match_set.keyIterator();
+        while (match_iter.next()) |pid_ptr| {
+            var current_pid = pid_ptr.*;
+            while (true) {
+                const proc = params.proc_map.get(current_pid) orelse break;
+                current_pid = proc.ppid;
+                if (current_pid <= 0) break;
+                if (ancestor_set.contains(current_pid) or match_set.contains(current_pid)) break;
+                ancestor_set.put(alloc, current_pid, {}) catch {};
+            }
+        }
+
+        // Pass 3: keep only matches + ancestors, preserving DFS tree order
+        var w: usize = 0;
+        for (filtered.items) |*entry| {
+            const is_match = match_set.contains(entry.pid);
+            const is_ancestor = ancestor_set.contains(entry.pid);
+            if (is_match or is_ancestor) {
+                // Force-expand ancestors of matches so the tree path is visible
+                if (is_ancestor) {
+                    entry.is_expanded = true;
+                }
+                entry.search_match = is_match;
+                filtered.items[w] = entry.*;
                 w += 1;
             }
         }
         filtered.shrinkRetainingCapacity(w);
     }
 
-    // Sort: explicit column sort takes priority; otherwise rank by search relevance
+    // Sort: explicit column sort takes priority; search preserves tree order (no relevance sort)
     const is_sorted = params.sort_column != .none;
     if (is_sorted) {
         const sort_ctx = SortContext{ .column = params.sort_column, .direction = params.sort_direction };
         std.mem.sortUnstable(TreeEntry, filtered.items, sort_ctx, sortCompare);
-    } else if (has_search) {
-        const search_ctx = SearchSortContext{ .needle = params.search_text };
-        std.mem.sortUnstable(TreeEntry, filtered.items, search_ctx, searchSortCompare);
     }
     const items = filtered.items;
 
@@ -143,16 +214,7 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
     var texts: std.ArrayListUnmanaged(layout.RowText) = .empty;
     try texts.ensureTotalCapacity(alloc, items.len);
 
-    var is_last: [64]bool = [_]bool{false} ** 64;
-
-    for (items, 0..) |entry, i| {
-        var prefix: []const u8 = "";
-        if (!is_sorted) {
-            const last = isLastSibling(items, i);
-            is_last[entry.depth] = last;
-            prefix = buildTreePrefix(entry.depth, &is_last, last, alloc);
-        }
-
+    for (items) |entry| {
         const cpu_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(entry.cpu_delta)) / cpu_capacity, 1.0));
         const mem_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(entry.proc_data.mem_rss)) / total_mem_f, 1.0));
         const disk_intensity: f32 = @floatCast(@min(@as(f64, @floatFromInt(entry.disk_delta)) / disk_ref, 1.0));
@@ -163,7 +225,7 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
                 std.fmt.allocPrint(alloc, "{d}", .{entry.pid}) catch "?",
                 params.col_widths[0], theme.font_size, alloc,
             ),
-            .name_prefix = prefix,
+            .name_prefix = "",
             .name = entry.proc_data.name,
             .cpu_str = truncateToFit(
                 formatCpuPercent(alloc, entry.cpu_delta, params.snapshot_interval_ns) catch "0%",
@@ -196,6 +258,9 @@ pub fn materialize(alloc: std.mem.Allocator, params: MaterializeParams) !Materia
             .raw_disk = entry.disk_delta,
             .raw_gpu = entry.gpu_delta,
             .pid = entry.pid,
+            .is_parent = if (is_sorted) false else entry.is_parent,
+            .is_expanded = if (is_sorted) true else entry.is_expanded,
+            .search_match = entry.search_match,
         });
     }
 
@@ -316,49 +381,10 @@ fn sortCompare(ctx: SortContext, a: TreeEntry, b: TreeEntry) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Search
+// Search helpers
 // ---------------------------------------------------------------------------
 
-const SearchSortContext = struct {
-    needle: []const u8,
-};
-
-/// Relevance score for search ranking (higher = better match).
-/// 4 = exact name match, 3 = name starts with, 2 = name contains, 1 = path-only match.
-fn searchRelevance(name: []const u8, path: []const u8, needle: []const u8) u8 {
-    if (caseInsensitiveEqual(name, needle)) return 4;
-    if (caseInsensitiveStartsWith(name, needle)) return 3;
-    if (caseInsensitiveContains(name, needle)) return 2;
-    if (caseInsensitiveContains(path, needle)) return 1;
-    return 0;
-}
-
-fn searchSortCompare(ctx: SearchSortContext, a: TreeEntry, b: TreeEntry) bool {
-    const ra = searchRelevance(a.proc_data.name, a.proc_data.path, ctx.needle);
-    const rb = searchRelevance(b.proc_data.name, b.proc_data.path, ctx.needle);
-    if (ra != rb) return ra > rb; // higher relevance first
-    // Tie-break: shorter name first (more specific match)
-    if (a.proc_data.name.len != b.proc_data.name.len) return a.proc_data.name.len < b.proc_data.name.len;
-    return false; // stable
-}
-
-fn caseInsensitiveEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ac, bc| {
-        if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
-    }
-    return true;
-}
-
-fn caseInsensitiveStartsWith(haystack: []const u8, prefix: []const u8) bool {
-    if (haystack.len < prefix.len) return false;
-    for (haystack[0..prefix.len], prefix) |hc, pc| {
-        if (std.ascii.toLower(hc) != std.ascii.toLower(pc)) return false;
-    }
-    return true;
-}
-
-fn caseInsensitiveContains(haystack: []const u8, needle: []const u8) bool {
+pub fn caseInsensitiveContains(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (haystack.len < needle.len) return false;
     const limit = haystack.len - needle.len + 1;
@@ -373,47 +399,6 @@ fn caseInsensitiveContains(haystack: []const u8, needle: []const u8) bool {
         if (match) return true;
     }
     return false;
-}
-
-// ---------------------------------------------------------------------------
-// Tree prefix
-// ---------------------------------------------------------------------------
-
-fn isLastSibling(entries: []const TreeEntry, i: usize) bool {
-    const d = entries[i].depth;
-    var j = i + 1;
-    while (j < entries.len) : (j += 1) {
-        if (entries[j].depth < d) return true;
-        if (entries[j].depth == d) return false;
-    }
-    return true;
-}
-
-fn buildTreePrefix(depth: u16, is_last_arr: *const [64]bool, self_is_last: bool, alloc: std.mem.Allocator) []const u8 {
-    if (depth == 0) return "";
-
-    const d: usize = @intCast(depth);
-    const max_len = (d - 1) * 4 + 7;
-    var parts: std.ArrayListUnmanaged(u8) = .empty;
-    parts.ensureTotalCapacity(alloc, max_len) catch return "";
-
-    var level: usize = 1;
-    while (level < d) : (level += 1) {
-        if (is_last_arr[level]) {
-            parts.appendSliceAssumeCapacity("  ");
-        } else {
-            parts.appendSliceAssumeCapacity("\xe2\x94\x82 "); // │ + space
-        }
-    }
-
-    if (self_is_last) {
-        parts.appendSliceAssumeCapacity("\xe2\x94\x94\xe2\x94\x80"); // └─
-    } else {
-        parts.appendSliceAssumeCapacity("\xe2\x94\x9c\xe2\x94\x80"); // ├─
-    }
-
-    parts.appendAssumeCapacity(' ');
-    return parts.items;
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@ const font = @import("font");
 const theme = @import("theme");
 const graph = @import("graph");
 const column_ops = @import("column_ops");
+const text_select = @import("text_select");
+const scrollbar = @import("scrollbar");
 
 const builtin = @import("builtin");
 const slog = sokol.log;
@@ -25,19 +27,21 @@ const native_menu = if (builtin.os.tag == .macos) @cImport({
 const native_ui = if (builtin.os.tag == .macos) @cImport({
     @cInclude("macos_window_style.h");
     @cInclude("macos_defaults.h");
+    @cInclude("macos_clipboard.h");
 }) else struct {
     pub fn setup_window_style() void {}
     pub fn register_theme_observer() void {}
     pub fn check_theme_notification() c_int { return -1; }
+    pub fn clipboard_set_string(_: [*c]const u8, _: c_int) void {}
 };
 
-const DetailTab = enum { overview, network };
+const DetailTab = enum { overview, network, environment, security };
 
 // Network column definitions
 const NetCol = enum(u3) { state_col = 0, local = 1, remote = 2, pid_col = 3, proto = 4, proc_name = 5 };
 const NET_COL_COUNT: u8 = 6;
 const NET_RESIZABLE: u8 = 5; // proc_name grows (not resizable)
-const net_default_widths = [NET_RESIZABLE]f32{ 80, 140, 140, 50, 42 };
+const net_default_widths = [NET_RESIZABLE]f32{ 80, 200, 200, 50, 42 };
 const net_default_order = [NET_COL_COUNT]u8{ 0, 1, 2, 3, 4, 5 };
 const net_col_labels = [NET_COL_COUNT][]const u8{ "STATE", "LOCAL", "REMOTE", "PID", "PROTO", "PROCESS" };
 
@@ -81,16 +85,23 @@ const state = struct {
     // Network column resize/reorder state
     var net_col_widths: [NET_RESIZABLE]f32 = net_default_widths;
     var net_col_order: [NET_COL_COUNT]u8 = net_default_order;
-    var net_dragging_col: ?u8 = null;
-    var net_drag_start_x: f32 = 0;
-    var net_drag_start_width: f32 = 0;
-    var net_dragging_header: ?u8 = null;
-    var net_header_drag_start_x: f32 = 0;
-    var net_header_drag_started: bool = false;
-    const header_drag_threshold: f32 = 5.0;
+    var net_drag: column_ops.ColumnDragState = .{};
 
     // Tab animation
     var tab_anim: f32 = 0.0; // 0=overview, 1=network
+
+    // Process args (environment tab)
+    var proc_args: ?process.ProcessArgs = null;
+
+    // Text selection state (drag-to-select within value cells)
+    var value_select: text_select.TextSelectState = .{};
+    var active_cell_idx: ?usize = null; // index into selectable_entries
+    var active_cell_x: f32 = 0; // bounding box X of active cell (from render commands)
+    var drag_start_y: f32 = 0; // mouse Y when drag started (to detect vertical scroll intent)
+
+    // Security info (fetched once)
+    var security_info: ?process.SecurityInfo = null;
+    var security_fetched: bool = false;
 
     // Preserve connections toggle
     var preserve_connections: bool = false;
@@ -98,6 +109,21 @@ const state = struct {
     var preserved_conns: std.ArrayListUnmanaged(process.TcpConnection) = .empty;
     var preserved_names: std.AutoHashMapUnmanaged(process.pid_t, []const u8) = .empty;
 };
+
+// Selectable entry tracking — populated during layout, queried during click
+const SelectableEntry = struct {
+    element_id: clay.ElementId,
+    text: []const u8,
+};
+var selectable_entries: [256]SelectableEntry = undefined;
+var selectable_count: usize = 0;
+
+fn registerSelectable(id: clay.ElementId, text: []const u8) void {
+    if (selectable_count < selectable_entries.len) {
+        selectable_entries[selectable_count] = .{ .element_id = id, .text = text };
+        selectable_count += 1;
+    }
+}
 
 const NET_TOOLBAR_HEIGHT: f32 = 32;
 
@@ -129,7 +155,8 @@ export fn init() void {
     state.snapshot_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     state.frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    // Init Clay
+    // Init Clay — raise element limit for large entitlement lists
+    clay.setMaxElementCount(16384);
     const min_mem: u32 = clay.minMemorySize();
     state.clay_memory = std.heap.page_allocator.alloc(u8, min_mem) catch {
         print("procz-detail: failed to allocate clay memory\n", .{});
@@ -157,8 +184,18 @@ fn collectData() void {
     state.proc_data = platform.collectProcess(alloc, state.target_pid);
     state.has_data = state.proc_data != null;
 
+    // Process arguments and environment variables
+    state.proc_args = platform.collectProcessArgs(alloc, state.target_pid);
+
     // Coalition ID
     state.coalition_id = platform.getCoalitionId(state.target_pid);
+
+    // Security info (only fetch once — entitlements don't change at runtime)
+    // Uses page_allocator since this data persists across snapshot_arena resets
+    if (!state.security_fetched) {
+        state.security_info = platform.collectSecurityInfo(std.heap.page_allocator, state.target_pid);
+        state.security_fetched = true;
+    }
 
     // TCP connections
     const all_conns = platform.collectTcpConnections(alloc) catch &.{};
@@ -304,9 +341,9 @@ export fn frame() void {
     // Cursor feedback for network tab column interactions
     if (state.active_tab == .network) {
         const cfg = netColumnConfig();
-        if (state.net_dragging_col != null) {
+        if (state.net_drag.dragging_col != null) {
             sapp.setMouseCursor(.RESIZE_EW);
-        } else if (state.net_header_drag_started) {
+        } else if (state.net_drag.header_drag_started) {
             sapp.setMouseCursor(.RESIZE_ALL);
         } else if (column_ops.hitTestEdge(state.mouse_x, state.mouse_y, cfg) != null) {
             sapp.setMouseCursor(.RESIZE_EW);
@@ -335,9 +372,14 @@ export fn frame() void {
             state.toggle_anim_t += diff * 0.18;
         }
     }
-    // Animate tab indicator cross-fade
+    // Animate tab indicator cross-fade (4 tabs: 0=overview, 1=network, 2=environment, 3=security)
     {
-        const target: f32 = if (state.active_tab == .network) 1.0 else 0.0;
+        const target: f32 = switch (state.active_tab) {
+            .overview => 0.0,
+            .network => 1.0,
+            .environment => 2.0,
+            .security => 3.0,
+        };
         const diff = target - state.tab_anim;
         if (@abs(diff) < 0.005) {
             state.tab_anim = target;
@@ -347,6 +389,26 @@ export fn frame() void {
     }
 
     const commands = buildLayout(frame_alloc);
+
+    // Extract bounding box X of active cell for hit-testing during drag
+    if (state.active_cell_idx) |idx| {
+        if (idx < selectable_count) {
+            const target_id = selectable_entries[idx].element_id.id;
+            for (commands) |cmd| {
+                if (cmd.command_type == .rectangle and cmd.id == target_id) {
+                    state.active_cell_x = cmd.bounding_box.x;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Register scrollbars for overlay rendering
+    scrollbar.reset();
+    scrollbar.addFromClay("overview-scroll", .{});
+    scrollbar.addFromClay("env-scroll", .{});
+    scrollbar.addFromClay("sec-scroll", .{});
+    scrollbar.addFromClay("net-scroll", .{ .vertical = true, .horizontal = true });
 
     sg.beginPass(.{
         .action = state.pass_action,
@@ -366,6 +428,14 @@ fn processClick() void {
         state.active_tab = .network;
         return;
     }
+    if (clay.pointerOver(clay.ElementId.ID("tab-environment"))) {
+        state.active_tab = .environment;
+        return;
+    }
+    if (clay.pointerOver(clay.ElementId.ID("tab-security"))) {
+        state.active_tab = .security;
+        return;
+    }
 
     // Toggle switch click
     if (clay.pointerOver(clay.ElementId.ID("toggle-preserve"))) {
@@ -383,10 +453,33 @@ fn processClick() void {
         }
         return;
     }
+
+    // Check if a selectable value cell was clicked (overview + environment + security tabs)
+    if (state.active_tab == .overview or state.active_tab == .environment or state.active_tab == .security) {
+        if (checkValueClick()) return;
+    }
+
+    // Click on empty area — deselect
+    state.value_select.clear();
+    state.active_cell_idx = null;
+}
+
+fn checkValueClick() bool {
+    for (selectable_entries[0..selectable_count], 0..) |entry, idx| {
+        if (clay.pointerOver(entry.element_id)) {
+            state.active_cell_idx = idx;
+            state.drag_start_y = state.mouse_y;
+            const char_pos = text_select.hitTestText(state.mouse_x, state.active_cell_x, entry.text, 13);
+            state.value_select.beginDrag(char_pos);
+            return true;
+        }
+    }
+    return false;
 }
 
 fn buildLayout(alloc: std.mem.Allocator) []clay.RenderCommand {
     conn_idx = 0;
+    selectable_count = 0;
     clay.beginLayout();
 
     const proc_opt = state.proc_data;
@@ -445,6 +538,8 @@ fn buildLayout(alloc: std.mem.Allocator) []clay.RenderCommand {
         switch (state.active_tab) {
             .overview => buildOverviewTab(alloc, proc_opt),
             .network => buildNetworkContent(alloc),
+            .environment => buildEnvironmentContent(alloc),
+            .security => buildSecurityTab(alloc),
         }
 
         // Network toolbar — floating overlay anchored to root, completely
@@ -486,8 +581,10 @@ fn buildTabBar() void {
         },
         .background_color = theme.tab_bg,
     })({
-        buildTabItem("tab-overview", "Overview", state.active_tab == .overview, 1.0 - state.tab_anim);
-        buildTabItem("tab-network", "Network", state.active_tab == .network, state.tab_anim);
+        buildTabItem("tab-overview", "Overview", state.active_tab == .overview, @max(0, 1.0 - @abs(state.tab_anim - 0.0)));
+        buildTabItem("tab-network", "Network", state.active_tab == .network, @max(0, 1.0 - @abs(state.tab_anim - 1.0)));
+        buildTabItem("tab-environment", "Environment", state.active_tab == .environment, @max(0, 1.0 - @abs(state.tab_anim - 2.0)));
+        buildTabItem("tab-security", "Security", state.active_tab == .security, @max(0, 1.0 - @abs(state.tab_anim - 3.0)));
     });
 }
 
@@ -638,6 +735,125 @@ fn buildOverviewTab(alloc: std.mem.Allocator, proc_opt: ?process.Proc) void {
     });
 }
 
+/// Insert newlines into long text at natural break points (/, :, =, ;) to enable wrapping.
+/// Falls back to hard character-level breaks for text without natural delimiters (e.g. base64).
+/// Uses the frame arena so results are valid for the current frame only.
+fn wrapLongText(text: []const u8) []const u8 {
+    // Dynamic max_line based on available value column width
+    const dpi = sapp.dpiScale();
+    const win_w = sapp.widthf() / dpi;
+    // Available: window - scroll padding(32) - card padding(28) - key column(200)
+    const avail_px = @max(win_w - 260, 100);
+    const char_w: f32 = 7.5; // approximate char width at font_size=13
+    const max_line: usize = @intFromFloat(@max(avail_px / char_w, 20));
+
+    if (text.len <= max_line) return text;
+
+    const alloc = state.frame_arena.allocator();
+
+    // First pass: find positions where newlines should be inserted.
+    var breaks: [256]usize = undefined;
+    var break_count: usize = 0;
+    var col: usize = 0;
+    var last_brk: usize = 0;
+    var has_brk: bool = false;
+
+    for (text, 0..) |ch, idx| {
+        col += 1;
+        if (ch == '/' or ch == ':' or ch == '=' or ch == ';' or ch == ' ' or ch == '-' or ch == ',' or ch == '\\' or ch == '&' or ch == '+') {
+            last_brk = idx;
+            has_brk = true;
+        }
+        if (col >= max_line) {
+            if (has_brk) {
+                // Break at last natural delimiter
+                if (break_count < breaks.len) {
+                    breaks[break_count] = last_brk;
+                    break_count += 1;
+                }
+                col = idx - last_brk;
+                has_brk = false;
+            } else {
+                // No natural break point — hard break at current position
+                if (break_count < breaks.len) {
+                    breaks[break_count] = idx;
+                    break_count += 1;
+                }
+                col = 0;
+            }
+        }
+    }
+
+    if (break_count == 0) return text;
+
+    // Second pass: copy text, inserting '\n' after each break position.
+    var buf = alloc.alloc(u8, text.len + break_count) catch return text;
+    var out: usize = 0;
+    var bi: usize = 0;
+
+    for (text, 0..) |ch, idx| {
+        buf[out] = ch;
+        out += 1;
+        if (bi < break_count and idx == breaks[bi]) {
+            buf[out] = '\n';
+            out += 1;
+            bi += 1;
+        }
+    }
+
+    return buf[0..out];
+}
+
+/// Check if a given selectable entry index is the active cell with a selection or cursor.
+fn isActiveCell(sel_idx: usize) bool {
+    const idx = state.active_cell_idx orelse return false;
+    return idx == sel_idx;
+}
+
+/// Render value text with selection highlight (split into pre/sel/post segments).
+fn renderValueWithSelection(text: []const u8) void {
+    if (state.value_select.selectedRange(text.len)) |r| {
+        // Three-segment rendering: pre-selection, selection highlight, post-selection
+        if (r.lo > 0) {
+            clay.text(text[0..r.lo], .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+        }
+        clay.UI()(.{
+            .layout = .{ .sizing = .{ .w = clay.SizingAxis.fit } },
+            .background_color = .{ theme.accent[0], theme.accent[1], theme.accent[2], 80 },
+            .corner_radius = clay.CornerRadius.all(2),
+        })({
+            clay.text(text[r.lo..r.hi], .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+        });
+        if (r.hi < text.len) {
+            clay.text(text[r.hi..], .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+        }
+    } else {
+        // Has cursor but no selection — render normally (cursor bar visual not needed for read-only cells)
+        clay.text(text, .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+    }
+}
+
+/// Like renderValueWithSelection but preserves the given text color for non-selected segments.
+fn renderValueWithSelectionColor(text: []const u8, color: clay.Color) void {
+    if (state.value_select.selectedRange(text.len)) |r| {
+        if (r.lo > 0) {
+            clay.text(text[0..r.lo], .{ .color = color, .font_size = 13, .line_height = 18 });
+        }
+        clay.UI()(.{
+            .layout = .{ .sizing = .{ .w = clay.SizingAxis.fit } },
+            .background_color = .{ theme.accent[0], theme.accent[1], theme.accent[2], 80 },
+            .corner_radius = clay.CornerRadius.all(2),
+        })({
+            clay.text(text[r.lo..r.hi], .{ .color = color, .font_size = 13, .line_height = 18 });
+        });
+        if (r.hi < text.len) {
+            clay.text(text[r.hi..], .{ .color = color, .font_size = 13, .line_height = 18 });
+        }
+    } else {
+        clay.text(text, .{ .color = color, .font_size = 13, .line_height = 18 });
+    }
+}
+
 /// Render a card container with label-value rows separated by hairlines.
 fn buildCard(comptime id: []const u8, items: []const struct { []const u8, []const u8 }) void {
     clay.UI()(.{
@@ -663,7 +879,7 @@ fn buildCard(comptime id: []const u8, items: []const struct { []const u8, []cons
                     .sizing = .{ .w = clay.SizingAxis.grow },
                     .direction = .left_to_right,
                     .padding = .{ .top = 6, .bottom = 6 },
-                    .child_alignment = .{ .y = .center },
+                    .child_alignment = .{ .y = .top },
                 },
             })({
                 // Label
@@ -671,20 +887,33 @@ fn buildCard(comptime id: []const u8, items: []const struct { []const u8, []cons
                     .id = clay.ElementId.IDI(id ++ "l", @intCast(i)),
                     .layout = .{
                         .sizing = .{ .w = clay.SizingAxis.fixed(140) },
-                        .child_alignment = .{ .x = .left, .y = .center },
+                        .padding = .{ .top = 1 },
+                        .child_alignment = .{ .x = .left },
                     },
                 })({
                     clay.text(item[0], .{ .color = theme.text_dim, .font_size = 13 });
                 });
-                // Value
+                // Value (drag-to-select)
+                const wrapped_val = wrapLongText(item[1]);
+                const val_id = clay.ElementId.IDI(id ++ "v", @intCast(i));
+                const sel_idx = selectable_count;
+                registerSelectable(val_id, wrapped_val);
+                const is_active = isActiveCell(sel_idx);
                 clay.UI()(.{
-                    .id = clay.ElementId.IDI(id ++ "v", @intCast(i)),
+                    .id = val_id,
                     .layout = .{
                         .sizing = .{ .w = clay.SizingAxis.grow },
-                        .child_alignment = .{ .x = .left, .y = .center },
+                        .child_alignment = .{ .x = .left },
+                        .direction = .left_to_right,
                     },
+                    .background_color = theme.transparent,
+                    .corner_radius = clay.CornerRadius.all(3),
                 })({
-                    clay.text(item[1], .{ .color = theme.text_primary, .font_size = 13 });
+                    if (is_active) {
+                        renderValueWithSelection(wrapped_val);
+                    } else {
+                        clay.text(wrapped_val, .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+                    }
                 });
             });
 
@@ -698,6 +927,377 @@ fn buildCard(comptime id: []const u8, items: []const struct { []const u8, []cons
                     .background_color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 40 },
                 })({});
             }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Environment tab
+// ---------------------------------------------------------------------------
+
+var env_row_idx: u16 = 0;
+
+fn buildEnvironmentContent(alloc: std.mem.Allocator) void {
+    clay.UI()(.{
+        .id = clay.ElementId.ID("env-scroll"),
+        .layout = .{
+            .sizing = clay.Sizing.grow,
+            .direction = .top_to_bottom,
+            .padding = .{ .left = 16, .right = 16, .top = 16, .bottom = 16 },
+            .child_gap = 12,
+        },
+        .clip = .{ .vertical = true, .child_offset = clay.getScrollOffset() },
+        .background_color = theme.bg,
+    })({
+        env_row_idx = 0;
+
+        if (state.proc_args) |args| {
+            // Arguments card
+            buildEnvCard("env-argv", "Arguments", args.argv, alloc, false);
+
+            // Environment Variables card
+            // Sort env vars alphabetically for display
+            const sorted_env = sortEnvVars(alloc, args.environ);
+            buildEnvCard("env-vars", "Environment Variables", sorted_env, alloc, true);
+        } else {
+            // Empty state
+            clay.UI()(.{
+                .id = clay.ElementId.ID("env-empty"),
+                .layout = .{
+                    .sizing = .{ .w = clay.SizingAxis.grow },
+                    .direction = .top_to_bottom,
+                    .padding = clay.Padding.all(24),
+                    .child_gap = 6,
+                    .child_alignment = .{ .x = .center },
+                },
+                .background_color = theme.graph_section_bg,
+                .corner_radius = clay.CornerRadius.all(theme.corner_radius),
+                .border = .{
+                    .color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 50 },
+                    .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
+                },
+            })({
+                clay.text("Environment data not available", .{
+                    .color = theme.text_primary,
+                    .font_size = 14,
+                });
+                clay.text("May require same-user process or entitlements.", .{
+                    .color = theme.text_dim,
+                    .font_size = 12,
+                });
+            });
+        }
+    });
+}
+
+fn sortEnvVars(alloc: std.mem.Allocator, environ: []const []const u8) []const []const u8 {
+    const sorted = alloc.dupe([]const u8, environ) catch return environ;
+    std.mem.sort([]const u8, sorted, {}, struct {
+        pub fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return sorted;
+}
+
+fn buildEnvCard(comptime id: []const u8, title: []const u8, items: []const []const u8, alloc: std.mem.Allocator, split_equals: bool) void {
+    _ = alloc;
+    const display_count = @min(items.len, 500);
+
+    clay.UI()(.{
+        .id = clay.ElementId.ID(id),
+        .layout = .{
+            .sizing = .{ .w = clay.SizingAxis.grow },
+            .direction = .top_to_bottom,
+            .padding = .{ .left = 14, .right = 14, .top = 10, .bottom = 10 },
+            .child_gap = 0,
+        },
+        .background_color = theme.graph_section_bg,
+        .corner_radius = clay.CornerRadius.all(theme.corner_radius),
+        .border = .{
+            .color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 50 },
+            .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
+        },
+    })({
+        // Title row
+        clay.UI()(.{
+            .id = clay.ElementId.ID(id ++ "-hdr"),
+            .layout = .{
+                .sizing = .{ .w = clay.SizingAxis.grow },
+                .padding = .{ .top = 4, .bottom = 8 },
+            },
+        })({
+            clay.text(title, .{ .color = theme.text_header, .font_size = 16 });
+        });
+
+        if (items.len == 0) {
+            clay.UI()(.{
+                .id = clay.ElementId.ID(id ++ "-none"),
+                .layout = .{
+                    .sizing = .{ .w = clay.SizingAxis.grow },
+                    .padding = .{ .top = 6, .bottom = 6 },
+                },
+            })({
+                clay.text("(none)", .{ .color = theme.text_dim, .font_size = 13 });
+            });
+        } else {
+            for (items[0..display_count], 0..) |item, i| {
+                // Row
+                clay.UI()(.{
+                    .id = clay.ElementId.IDI(id ++ "r", @intCast(env_row_idx)),
+                    .layout = .{
+                        .sizing = .{ .w = clay.SizingAxis.grow },
+                        .direction = .left_to_right,
+                        .padding = .{ .top = 4, .bottom = 4 },
+                        .child_alignment = .{ .y = .top },
+                    },
+                    .background_color = if (i % 2 == 0) theme.transparent else .{ theme.separator[0], theme.separator[1], theme.separator[2], 15 },
+                })({
+                    if (split_equals) {
+                        // Split on '=' into KEY and VALUE
+                        if (std.mem.indexOfScalar(u8, item, '=')) |eq_pos| {
+                            // Key
+                            clay.UI()(.{
+                                .id = clay.ElementId.IDI(id ++ "k", @intCast(env_row_idx)),
+                                .layout = .{
+                                    .sizing = .{ .w = clay.SizingAxis.fixed(200) },
+                                    .padding = .{ .top = 1 },
+                                    .child_alignment = .{ .x = .left },
+                                },
+                            })({
+                                clay.text(item[0..eq_pos], .{ .color = theme.text_dim, .font_size = 13 });
+                            });
+                            // Value (drag-to-select)
+                            const val_start = eq_pos + 1;
+                            const val = if (val_start < item.len) item[val_start..] else "";
+                            const wrapped_env_val = wrapLongText(val);
+                            const env_val_id = clay.ElementId.IDI(id ++ "v", @intCast(env_row_idx));
+                            const env_sel_idx = selectable_count;
+                            registerSelectable(env_val_id, wrapped_env_val);
+                            const env_is_active = isActiveCell(env_sel_idx);
+                            clay.UI()(.{
+                                .id = env_val_id,
+                                .layout = .{
+                                    .sizing = .{ .w = clay.SizingAxis.grow },
+                                    .child_alignment = .{ .x = .left },
+                                    .direction = .left_to_right,
+                                },
+                                .background_color = theme.transparent,
+                                .corner_radius = clay.CornerRadius.all(3),
+                            })({
+                                if (env_is_active) {
+                                    renderValueWithSelection(wrapped_env_val);
+                                } else {
+                                    clay.text(wrapped_env_val, .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+                                }
+                            });
+                        } else {
+                            // No '=' found, show as-is
+                            clay.text(wrapLongText(item), .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+                        }
+                    } else {
+                        // Show index prefix for argv
+                        clay.UI()(.{
+                            .id = clay.ElementId.IDI(id ++ "ix", @intCast(env_row_idx)),
+                            .layout = .{
+                                .sizing = .{ .w = clay.SizingAxis.fixed(40) },
+                                .padding = .{ .top = 1 },
+                                .child_alignment = .{ .x = .left },
+                            },
+                        })({
+                            const idx_str = std.fmt.allocPrint(state.frame_arena.allocator(), "[{d}]", .{i}) catch "?";
+                            clay.text(idx_str, .{ .color = theme.text_dim, .font_size = 13 });
+                        });
+                        // Value (drag-to-select)
+                        const wrapped_argv_val = wrapLongText(item);
+                        const argv_val_id = clay.ElementId.IDI(id ++ "va", @intCast(env_row_idx));
+                        const argv_sel_idx = selectable_count;
+                        registerSelectable(argv_val_id, wrapped_argv_val);
+                        const argv_is_active = isActiveCell(argv_sel_idx);
+                        clay.UI()(.{
+                            .id = argv_val_id,
+                            .layout = .{
+                                .sizing = .{ .w = clay.SizingAxis.grow },
+                                .child_alignment = .{ .x = .left },
+                                .direction = .left_to_right,
+                            },
+                            .background_color = theme.transparent,
+                            .corner_radius = clay.CornerRadius.all(3),
+                        })({
+                            if (argv_is_active) {
+                                renderValueWithSelection(wrapped_argv_val);
+                            } else {
+                                clay.text(wrapped_argv_val, .{ .color = theme.text_primary, .font_size = 13, .line_height = 18 });
+                            }
+                        });
+                    }
+                });
+                env_row_idx +%= 1;
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Security tab
+// ---------------------------------------------------------------------------
+
+var sec_row_idx: u16 = 0;
+
+fn buildSecurityTab(alloc: std.mem.Allocator) void {
+    sec_row_idx = 0;
+    clay.UI()(.{
+        .id = clay.ElementId.ID("sec-scroll"),
+        .layout = .{
+            .sizing = clay.Sizing.grow,
+            .direction = .top_to_bottom,
+            .padding = .{ .left = 16, .right = 16, .top = 16, .bottom = 16 },
+            .child_gap = 12,
+        },
+        .clip = .{ .vertical = true, .child_offset = clay.getScrollOffset() },
+        .background_color = theme.bg,
+    })({
+        if (state.security_info) |info| {
+            // --- Code Signing card ---
+            buildCard("card-sign", &.{
+                .{ "Signing Identity", if (info.code_sign_id.len > 0) info.code_sign_id else "(unsigned)" },
+                .{ "Team ID", if (info.team_id.len > 0) info.team_id else "(none)" },
+                .{ "Authority", if (info.signing_authority.len > 0) info.signing_authority else "(none)" },
+                .{ "Format", if (info.format.len > 0) info.format else "(unknown)" },
+            });
+
+            // --- Sandbox card ---
+            buildCard("card-sandbox", &.{
+                .{ "Sandboxed", if (info.is_sandboxed) "Yes" else "No" },
+            });
+
+            // --- Entitlements card ---
+            if (info.entitlements.len > 0) {
+                buildEntitlementsCard(alloc, info.entitlements);
+            } else {
+                buildCard("card-ent", &.{
+                    .{ "Entitlements", "(none)" },
+                });
+            }
+        } else {
+            // Not available
+            clay.UI()(.{
+                .id = clay.ElementId.ID("sec-empty"),
+                .layout = .{
+                    .sizing = .{ .w = clay.SizingAxis.grow },
+                    .direction = .top_to_bottom,
+                    .padding = clay.Padding.all(24),
+                    .child_gap = 6,
+                    .child_alignment = .{ .x = .center },
+                },
+                .background_color = theme.graph_section_bg,
+                .corner_radius = clay.CornerRadius.all(theme.corner_radius),
+                .border = .{
+                    .color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 50 },
+                    .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
+                },
+            })({
+                clay.text("Security data not available", .{
+                    .color = theme.text_primary,
+                    .font_size = 14,
+                });
+                clay.text("Process may have exited or requires entitlements.", .{
+                    .color = theme.text_dim,
+                    .font_size = 12,
+                });
+            });
+        }
+    });
+}
+
+fn buildEntitlementsCard(alloc: std.mem.Allocator, entitlements: []const process.Entitlement) void {
+    const display_count = @min(entitlements.len, 100);
+
+    clay.UI()(.{
+        .id = clay.ElementId.ID("card-ent"),
+        .layout = .{
+            .sizing = .{ .w = clay.SizingAxis.grow },
+            .direction = .top_to_bottom,
+            .padding = .{ .left = 14, .right = 14, .top = 10, .bottom = 10 },
+            .child_gap = 0,
+        },
+        .background_color = theme.graph_section_bg,
+        .corner_radius = clay.CornerRadius.all(theme.corner_radius),
+        .border = .{
+            .color = .{ theme.separator[0], theme.separator[1], theme.separator[2], 50 },
+            .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 },
+        },
+    })({
+        // Title with count
+        clay.UI()(.{
+            .id = clay.ElementId.ID("ent-hdr"),
+            .layout = .{
+                .sizing = .{ .w = clay.SizingAxis.grow },
+                .padding = .{ .top = 4, .bottom = 8 },
+                .direction = .left_to_right,
+                .child_gap = 8,
+                .child_alignment = .{ .y = .center },
+            },
+        })({
+            clay.text("Entitlements", .{ .color = theme.text_header, .font_size = 16 });
+            const count_str = std.fmt.allocPrint(alloc, "({d})", .{entitlements.len}) catch "";
+            clay.text(count_str, .{ .color = theme.text_dim, .font_size = 12 });
+        });
+
+        for (entitlements[0..display_count], 0..) |ent, i| {
+            // Row — top-to-bottom layout so key and value each get full width
+            clay.UI()(.{
+                .id = clay.ElementId.IDI("entr", @intCast(sec_row_idx)),
+                .layout = .{
+                    .sizing = .{ .w = clay.SizingAxis.grow },
+                    .direction = .top_to_bottom,
+                    .padding = .{ .left = 4, .right = 4, .top = 6, .bottom = 6 },
+                },
+                .background_color = if (i % 2 == 0) theme.transparent else .{ theme.separator[0], theme.separator[1], theme.separator[2], 15 },
+            })({
+                // Key (full width)
+                clay.UI()(.{
+                    .id = clay.ElementId.IDI("entk", @intCast(sec_row_idx)),
+                    .layout = .{
+                        .sizing = .{ .w = clay.SizingAxis.grow },
+                        .child_alignment = .{ .x = .left },
+                    },
+                })({
+                    clay.text(ent.key, .{ .color = theme.text_dim, .font_size = 12, .wrap_mode = .none });
+                });
+                // Value — displayed below the key with wrapping
+                const wrapped_val = wrapLongText(ent.value);
+                const val_id = clay.ElementId.IDI("entv", @intCast(sec_row_idx));
+                const sel_idx = selectable_count;
+                registerSelectable(val_id, wrapped_val);
+                const is_active = isActiveCell(sel_idx);
+                clay.UI()(.{
+                    .id = val_id,
+                    .layout = .{
+                        .sizing = .{ .w = clay.SizingAxis.grow },
+                        .child_alignment = .{ .x = .left },
+                        .direction = .left_to_right,
+                        .padding = .{ .top = 2 },
+                    },
+                    .background_color = theme.transparent,
+                    .corner_radius = clay.CornerRadius.all(3),
+                })({
+                    // Color-code booleans for quick scanning
+                    const val_color = if (std.mem.eql(u8, ent.value, "true"))
+                        theme.accent
+                    else if (std.mem.eql(u8, ent.value, "false"))
+                        clay.Color{ 255, 100, 100, 255 }
+                    else
+                        theme.text_primary;
+
+                    if (is_active and state.value_select.hasSelection()) {
+                        renderValueWithSelectionColor(wrapped_val, val_color);
+                    } else {
+                        clay.text(wrapped_val, .{ .color = val_color, .font_size = 13, .line_height = 18 });
+                    }
+                });
+            });
+            sec_row_idx +%= 1;
         }
     });
 }
@@ -738,7 +1338,7 @@ fn buildNetworkContent(alloc: std.mem.Allocator) void {
         })({
             for (state.net_col_order) |col_idx| {
                 const col: NetCol = @enumFromInt(col_idx);
-                const is_dragged = if (state.net_header_drag_started) if (state.net_dragging_header) |dh| dh == col_idx else false else false;
+                const is_dragged = if (state.net_drag.header_drag_started) if (state.net_drag.dragging_header) |dh| dh == col_idx else false else false;
                 const alpha: f32 = if (is_dragged) 120 else 255;
                 if (col == .proc_name) {
                     // Grow column
@@ -791,7 +1391,7 @@ fn buildNetworkContent(alloc: std.mem.Allocator) void {
             }
 
             // Drop indicator: floating accent line at the target drop position
-            if (state.net_header_drag_started) {
+            if (state.net_drag.header_drag_started) {
                 const drop_x = column_ops.computeDropX(state.mouse_x, netColumnConfig());
                 clay.UI()(.{
                     .id = clay.ElementId.ID("net-drop"),
@@ -817,7 +1417,7 @@ fn buildNetworkContent(alloc: std.mem.Allocator) void {
                 .sizing = clay.Sizing.grow,
                 .direction = .top_to_bottom,
             },
-            .clip = .{ .vertical = true, .child_offset = clay.getScrollOffset() },
+            .clip = .{ .vertical = true, .horizontal = true, .child_offset = clay.getScrollOffset() },
         })({
             if (state.connections.len == 0) {
                 clay.UI()(.{
@@ -1006,7 +1606,7 @@ fn connCell(comptime prefix: []const u8, width: f32, text_content: []const u8, c
             .child_alignment = .{ .x = .left, .y = .center },
         },
     })({
-        clay.text(text_content, .{ .color = color, .font_size = 13 });
+        clay.text(text_content, .{ .color = color, .font_size = 13, .wrap_mode = .none });
     });
 }
 
@@ -1029,6 +1629,24 @@ export fn cleanup() void {
     sg.shutdown();
 }
 
+/// Get the text of the currently active selectable cell (if any).
+fn activeSelText() ?[]const u8 {
+    const idx = state.active_cell_idx orelse return null;
+    if (idx < selectable_count) return selectable_entries[idx].text;
+    return null;
+}
+
+/// Copy the selected sub-range (or full value as fallback) to clipboard.
+fn copySelection() void {
+    const full_text = activeSelText() orelse return;
+    if (state.value_select.selectedRange(full_text.len)) |r| {
+        native_ui.clipboard_set_string(full_text[r.lo..r.hi].ptr, @intCast(r.hi - r.lo));
+    } else {
+        // No sub-range selected — copy entire value
+        native_ui.clipboard_set_string(full_text.ptr, @intCast(full_text.len));
+    }
+}
+
 export fn onEvent(ev: [*c]const sapp.Event) void {
     const e = ev.*;
     const dpi = sapp.dpiScale();
@@ -1036,46 +1654,40 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         .MOUSE_MOVE => {
             state.mouse_x = e.mouse_x / dpi;
             state.mouse_y = e.mouse_y / dpi;
-            // Handle column resize drag (network tab)
-            if (state.net_dragging_col) |col_idx| {
-                const delta = state.mouse_x - state.net_drag_start_x;
-                // Cap so total fixed columns never exceed window width
-                const dpi2 = sapp.dpiScale();
-                const win_w = sapp.widthf() / dpi2;
-                var other_total: f32 = 0;
-                for (0..NET_RESIZABLE) |j| {
-                    if (j != col_idx) other_total += state.net_col_widths[j];
+            // Scrollbar drag takes priority
+            if (scrollbar.isDragging()) {
+                scrollbar.handleMouseMove(state.mouse_x, state.mouse_y);
+            } else {
+                // Handle value cell text selection drag
+                if (state.value_select.dragging) {
+                    // If mouse moved >8px vertically from drag start, cancel text selection
+                    // and let Clay's scroll container handle it instead
+                    const dy = @abs(state.mouse_y - state.drag_start_y);
+                    if (dy > 8) {
+                        state.value_select.clear();
+                        state.active_cell_idx = null;
+                    } else if (activeSelText()) |text| {
+                        const char_pos = text_select.hitTestText(state.mouse_x, state.active_cell_x, text, 13);
+                        state.value_select.updateDrag(char_pos);
+                    }
                 }
-                // Reserve 28px padding + 60px minimum for grow column
-                const max_w = @max(win_w - other_total - 28.0 - 60.0, 30.0);
-                const new_width = @min(@max(state.net_drag_start_width + delta, 30.0), max_w);
-                state.net_col_widths[col_idx] = new_width;
-            }
-            // Handle column header reorder drag threshold
-            if (state.net_dragging_header != null and !state.net_header_drag_started) {
-                if (@abs(state.mouse_x - state.net_header_drag_start_x) >= state.header_drag_threshold) {
-                    state.net_header_drag_started = true;
-                }
+                // Handle column resize/reorder drag (network tab)
+                state.net_drag.handleMouseMove(state.mouse_x, &state.net_col_widths);
             }
         },
         .MOUSE_DOWN => {
-            if (e.mouse_button == .LEFT) {
+            if (e.mouse_button == .RIGHT) {
+                // Right-click: copy selected text to clipboard
+                copySelection();
+            } else if (e.mouse_button == .LEFT) {
                 state.mouse_x = e.mouse_x / dpi;
                 state.mouse_y = e.mouse_y / dpi;
 
-                if (state.active_tab == .network) {
-                    const cfg = netColumnConfig();
-                    // Check column resize edge first (highest priority)
-                    if (column_ops.hitTestEdge(state.mouse_x, state.mouse_y, cfg)) |col_idx| {
-                        state.net_dragging_col = col_idx;
-                        state.net_drag_start_x = state.mouse_x;
-                        state.net_drag_start_width = state.net_col_widths[col_idx];
-                        state.mouse_down = true;
-                    } else if (column_ops.hitTestHeader(state.mouse_x, state.mouse_y, cfg)) |col_idx| {
-                        // Start potential column header drag
-                        state.net_dragging_header = col_idx;
-                        state.net_header_drag_start_x = state.mouse_x;
-                        state.net_header_drag_started = false;
+                // Scrollbar hit-test first
+                if (scrollbar.handleMouseDown(state.mouse_x, state.mouse_y)) {
+                    state.mouse_down = true;
+                } else if (state.active_tab == .network) {
+                    if (state.net_drag.handleMouseDown(state.mouse_x, state.mouse_y, netColumnConfig(), &state.net_col_widths)) {
                         state.mouse_down = true;
                     } else {
                         state.mouse_down = true;
@@ -1089,25 +1701,28 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         },
         .MOUSE_UP => {
             if (e.mouse_button == .LEFT) {
-                if (state.net_header_drag_started) {
-                    // Finalize column reorder
-                    if (state.net_dragging_header) |src_col| {
-                        const drop_pos = column_ops.findDropPos(state.mouse_x, netColumnConfig());
-                        column_ops.reorder(&state.net_col_order, src_col, drop_pos, NET_COL_COUNT);
-                    }
-                } else if (state.net_dragging_header != null) {
-                    // Threshold not met — treat as simple click
+                // End scrollbar drag
+                scrollbar.handleMouseUp();
+
+                // End value cell text selection drag
+                if (state.value_select.dragging) {
+                    state.value_select.endDrag();
+                }
+                if (state.net_drag.handleMouseUp(state.mouse_x, netColumnConfig(), &state.net_col_order, NET_COL_COUNT)) {
                     state.mouse_clicked = true;
                 }
-                state.net_dragging_header = null;
-                state.net_header_drag_started = false;
                 state.mouse_down = false;
-                state.net_dragging_col = null;
             }
         },
         .MOUSE_SCROLL => {
             state.scroll_dx += e.scroll_x;
             state.scroll_dy += e.scroll_y;
+        },
+        .KEY_DOWN => {
+            // Cmd+C: copy selected text to clipboard
+            if (e.key_code == .C and (e.modifiers & sapp.modifier_super) != 0) {
+                copySelection();
+            }
         },
         else => {},
     }
@@ -1151,6 +1766,7 @@ pub fn main() void {
             .width = 600,
             .height = 500,
             .high_dpi = true,
+            .swap_interval = 4, // 30fps on 120Hz ProMotion, 15fps on 60Hz — detail window is mostly static
             .window_title = "procz-detail",
             .icon = .{ .sokol_default = true },
             .logger = .{ .func = slog.func },
@@ -1166,6 +1782,7 @@ pub fn main() void {
         .width = 600,
         .height = 500,
         .high_dpi = true,
+        .swap_interval = 4, // 30fps on 120Hz ProMotion, 15fps on 60Hz — detail window is mostly static
         .window_title = title_slice.ptr,
         .icon = .{ .sokol_default = true },
         .logger = .{ .func = slog.func },

@@ -52,6 +52,10 @@ var icon_tmp: [ICON_SIZE * ICON_SIZE * 4]u8 = undefined;
 /// The renderer uses the IDI index to look up the PID from this array.
 pub var visible_pids: []const i32 = &.{};
 
+/// Visible row range set by main.zig each frame. Limits icon ID matching
+/// to only the ~30 rows that have Clay elements, instead of all 2048.
+pub var visible_range: struct { first: usize, count: usize } = .{ .first = 0, .count = 0 };
+
 // ---------------------------------------------------------------------------
 // Native icon loader (from ObjC, linked via native_ui_lib on macOS)
 // ---------------------------------------------------------------------------

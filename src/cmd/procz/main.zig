@@ -12,8 +12,10 @@ const theme = @import("theme");
 const graph = @import("graph");
 const display = @import("display");
 const column_ops = @import("column_ops");
+const text_select = @import("text_select");
 const font = @import("font");
 const icon_cache = @import("icon_cache");
+const scrollbar = @import("scrollbar");
 
 const builtin = @import("builtin");
 const slog = sokol.log;
@@ -38,6 +40,7 @@ const native_ui = if (builtin.os.tag == .macos) @cImport({
     @cInclude("macos_defaults.h");
     @cInclude("macos_app_icon.h");
     @cInclude("macos_clipboard.h");
+    @cInclude("macos_dropdown.h");
 }) else struct {
     pub fn setup_window_style() void {}
     pub fn is_system_dark_mode() c_int { return 1; }
@@ -55,6 +58,7 @@ const native_ui = if (builtin.os.tag == .macos) @cImport({
     pub fn check_theme_notification() c_int { return -1; }
     pub fn clipboard_set_string(_: [*c]const u8, _: c_int) void {}
     pub fn clipboard_get_string(_: [*c]u8, _: c_int) c_int { return 0; }
+    pub fn show_dropdown_menu(_: [*c]const [*c]const u8, _: c_int, _: c_int) c_int { return -1; }
 };
 
 const state = struct {
@@ -129,19 +133,11 @@ const state = struct {
     // Column widths (mutable, initialized from theme defaults)
     var col_widths: [6]f32 = .{ theme.col_pid, theme.col_name, theme.col_cpu, theme.col_mem, theme.col_disk, theme.col_gpu };
 
-    // Column resize drag state
-    var dragging_col: ?u8 = null; // index into col_widths being dragged
-    var drag_start_x: f32 = 0;
-    var drag_start_width: f32 = 0;
-
     // Column order (display position → logical column index)
     var col_order: [layout.COL_COUNT]u8 = layout.default_col_order;
 
-    // Column header drag-to-reorder state
-    var dragging_header: ?u8 = null; // logical column index being dragged
-    var header_drag_start_x: f32 = 0;
-    var header_drag_started: bool = false; // true once mouse moved enough to start drag
-    const header_drag_threshold: f32 = 5.0; // pixels before drag activates
+    // Column resize + header drag state (processes tab)
+    var proc_drag: column_ops.ColumnDragState = .{};
 
     // Settings popup state
     var settings_open: bool = false;
@@ -160,9 +156,7 @@ const state = struct {
     var search_focused: bool = false;
     var cursor_blink_timer: f64 = 0;
     var consume_next_char: bool = false; // suppress CHAR after slash-to-focus
-    var cursor_pos: usize = 0; // cursor position within search_buf (0..search_len)
-    var selection_start: ?usize = null; // anchor for text selection (null = no selection)
-    var search_dragging: bool = false; // drag-selecting in search bar
+    var search_select: text_select.TextSelectState = .{}; // shared drag-to-select state
     var search_bar_x: f32 = 0; // cached search bar X from render commands
 
     // Animation state
@@ -190,11 +184,46 @@ const state = struct {
     var delta_map: std.AutoHashMap(process.pid_t, display.DeltaEntry) = undefined;
     var delta_map_inited: bool = false;
 
+    // Startup items (from SPSC producer thread)
+    var startup_items: []const process.StartupItem = &.{};
+    var startup_arena: std.heap.ArenaAllocator = undefined;
+    var startup_arena_inited: bool = false;
+
+    // Startup tab column widths & order (indexed by logical col; idx 1 = program/grow, unused)
+    var su_col_widths: [layout.SU_COL_COUNT]f32 = .{ 240, 0, 80, 80, 80, 70 };
+    var su_col_order: [layout.SU_COL_COUNT]u8 = layout.default_su_col_order;
+
+    // Column resize + header drag state (startup tab)
+    var su_drag: column_ops.ColumnDragState = .{};
+
     // Per-core CPU utilization
     var prev_core_ticks: [platform.MAX_CORES]platform.CoreTicks = [_]platform.CoreTicks{.{}} ** platform.MAX_CORES;
     var curr_core_ticks: [platform.MAX_CORES]platform.CoreTicks = [_]platform.CoreTicks{.{}} ** platform.MAX_CORES;
     var core_count: usize = 0;
     var core_utils: [platform.MAX_CORES]f32 = [_]f32{0} ** platform.MAX_CORES;
+
+    // Network tab state
+    var net_col_widths: [layout.NET_RESIZABLE]f32 = layout.net_default_widths;
+    var net_col_order: [layout.NET_COL_COUNT]u8 = layout.default_net_col_order;
+    var net_drag: column_ops.ColumnDragState = .{};
+    var connections: []const process.TcpConnection = &.{};
+    var conn_names: std.AutoHashMapUnmanaged(process.pid_t, []const u8) = .empty;
+    var conn_names_arena: std.heap.ArenaAllocator = undefined;
+    var conn_names_arena_inited: bool = false;
+
+    // Network stats (cumulative counters + per-second rates)
+    var net_stats: process.NetworkStats = .{};
+    var prev_net_stats: process.NetworkStats = .{};
+    var net_has_prev: bool = false;
+    var net_packets_in_rate: f64 = 0;
+    var net_packets_out_rate: f64 = 0;
+    var net_bytes_in_rate: f64 = 0;
+    var net_bytes_out_rate: f64 = 0;
+    var net_chart_mode: u8 = 0; // 0 = packets, 1 = data
+
+    // Tree disclosure triangle state (collapsed PIDs)
+    var collapsed_pids: std.AutoHashMap(process.pid_t, void) = undefined;
+    var collapsed_pids_inited: bool = false;
 };
 
 fn clayErrorHandler(err: clay.ErrorData) callconv(.c) void {
@@ -219,7 +248,8 @@ export fn init() void {
     state.frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     state.display_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    // Init Clay
+    // Init Clay — raise element limit for network tab with many connections + stats strip
+    clay.setMaxElementCount(32768);
     const min_mem: u32 = clay.minMemorySize();
     state.clay_memory = std.heap.page_allocator.alloc(u8, min_mem) catch {
         print("procz: failed to allocate clay memory\n", .{});
@@ -242,6 +272,10 @@ export fn init() void {
     // Init animation state
     state.row_flash_map = std.AutoHashMap(process.pid_t, f32).init(std.heap.page_allocator);
     state.row_flash_inited = true;
+
+    // Init tree collapse state
+    state.collapsed_pids = std.AutoHashMap(process.pid_t, void).init(std.heap.page_allocator);
+    state.collapsed_pids_inited = true;
 
     // Fetch total physical memory once
     state.total_memory = platform.getTotalMemory();
@@ -380,6 +414,83 @@ fn drainEvents() void {
                 };
                 state.current_rows = rows;
                 state.display_dirty = true;
+
+                // Collect system-wide TCP connections for Network tab
+                {
+                    state.connections = platform.collectTcpConnections(snap_alloc) catch &.{};
+
+                    // Build PID → name map from proc_map for connection display
+                    if (!state.conn_names_arena_inited) {
+                        state.conn_names_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                        state.conn_names_arena_inited = true;
+                    } else {
+                        _ = state.conn_names_arena.reset(.retain_capacity);
+                    }
+                    state.conn_names = .empty;
+                    const cn_alloc = state.conn_names_arena.allocator();
+                    for (state.connections) |conn| {
+                        if (state.conn_names.contains(conn.pid)) continue;
+                        if (state.proc_map.get(conn.pid)) |p| {
+                            state.conn_names.put(cn_alloc, conn.pid, p.name) catch continue;
+                        }
+                    }
+                }
+
+                // Collect network interface stats and compute rates
+                {
+                    state.prev_net_stats = state.net_stats;
+                    state.net_stats = platform.collectNetworkStats();
+
+                    if (state.net_has_prev) {
+                        const interval_s: f64 = @as(f64, @floatFromInt(state.snapshot_interval_ns)) / 1_000_000_000.0;
+                        if (interval_s > 0) {
+                            const dpkti: f64 = @floatFromInt(state.net_stats.packets_in -| state.prev_net_stats.packets_in);
+                            const dpkto: f64 = @floatFromInt(state.net_stats.packets_out -| state.prev_net_stats.packets_out);
+                            const dbyti: f64 = @floatFromInt(state.net_stats.bytes_in -| state.prev_net_stats.bytes_in);
+                            const dbyto: f64 = @floatFromInt(state.net_stats.bytes_out -| state.prev_net_stats.bytes_out);
+                            state.net_packets_in_rate = dpkti / interval_s;
+                            state.net_packets_out_rate = dpkto / interval_s;
+                            state.net_bytes_in_rate = dbyti / interval_s;
+                            state.net_bytes_out_rate = dbyto / interval_s;
+
+                            // Push to network graph histories
+                            graph.net_packets_history.push(@floatCast(state.net_packets_in_rate), @floatCast(state.net_packets_out_rate));
+                            graph.net_bytes_history.push(@floatCast(state.net_bytes_in_rate), @floatCast(state.net_bytes_out_rate));
+                        }
+                    }
+                    state.net_has_prev = true;
+                }
+
+                // Copy startup items if present in this batch
+                if (batch.startup_items.len > 0) {
+                    if (!state.startup_arena_inited) {
+                        state.startup_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                        state.startup_arena_inited = true;
+                    } else {
+                        _ = state.startup_arena.reset(.retain_capacity);
+                    }
+                    const su_alloc = state.startup_arena.allocator();
+                    const items = su_alloc.alloc(process.StartupItem, batch.startup_items.len) catch {
+                        state.startup_items = &.{};
+                        continue;
+                    };
+                    var su_count: usize = 0;
+                    for (batch.startup_items) |src| {
+                        const label = su_alloc.dupe(u8, src.label) catch continue;
+                        const program = su_alloc.dupe(u8, src.program) catch continue;
+                        items[su_count] = .{
+                            .label = label,
+                            .program = program,
+                            .pid = src.pid,
+                            .run_at_load = src.run_at_load,
+                            .keep_alive = src.keep_alive,
+                            .is_user_agent = src.is_user_agent,
+                        };
+                        su_count += 1;
+                    }
+                    state.startup_items = items[0..su_count];
+                }
+
                 print("procz: snapshot {d} procs, {d} rows\n", .{ state.proc_count, rows.len });
             },
             .exit => |pid| {
@@ -506,6 +617,31 @@ fn insertTopInfo(arr: *[5]GraphTopInfo, count: *u8, name: []const u8, value: f32
     }
 }
 
+fn formatBytes(alloc: std.mem.Allocator, bytes: u64) []const u8 {
+    const b: f64 = @floatFromInt(bytes);
+    if (b >= 1_073_741_824.0) {
+        return std.fmt.allocPrint(alloc, "{d:.2} GB", .{b / 1_073_741_824.0}) catch "0 B";
+    } else if (b >= 1_048_576.0) {
+        return std.fmt.allocPrint(alloc, "{d:.1} MB", .{b / 1_048_576.0}) catch "0 B";
+    } else if (b >= 1_024.0) {
+        return std.fmt.allocPrint(alloc, "{d:.1} KB", .{b / 1_024.0}) catch "0 B";
+    } else {
+        return std.fmt.allocPrint(alloc, "{d} B", .{bytes}) catch "0 B";
+    }
+}
+
+fn formatBytesRate(alloc: std.mem.Allocator, rate: f64) []const u8 {
+    if (rate >= 1_073_741_824.0) {
+        return std.fmt.allocPrint(alloc, "{d:.2} GB/s", .{rate / 1_073_741_824.0}) catch "0 B/s";
+    } else if (rate >= 1_048_576.0) {
+        return std.fmt.allocPrint(alloc, "{d:.1} MB/s", .{rate / 1_048_576.0}) catch "0 B/s";
+    } else if (rate >= 1_024.0) {
+        return std.fmt.allocPrint(alloc, "{d:.1} KB/s", .{rate / 1_024.0}) catch "0 B/s";
+    } else {
+        return std.fmt.allocPrint(alloc, "{d:.0} B/s", .{rate}) catch "0 B/s";
+    }
+}
+
 fn updateCoreUtilization() void {
     // Save previous ticks
     state.prev_core_ticks = state.curr_core_ticks;
@@ -598,6 +734,9 @@ fn materializeIfNeeded() void {
         .total_memory = state.total_memory,
         .proc_count = state.proc_count,
         .core_utils = state.core_utils[0..state.core_count],
+        .collapsed_pids = if (state.collapsed_pids_inited) &state.collapsed_pids else null,
+        .tree_adj = &state.tree_result.adj,
+        .tree_pid_to_index = &state.tree_result.pid_to_index,
     }) catch |err| {
         print("procz: materialize failed: {}\n", .{err});
         return;
@@ -628,6 +767,19 @@ fn loadPreferences() void {
         const val = native_ui.defaults_get_float(key.ptr, defaults[i]);
         if (val >= 30.0 and val <= 600.0) state.col_widths[i] = val;
     }
+
+    // Load startup column widths (indexed by logical col, skipping grow col 1)
+    const su_keys = [_]struct { key: []const u8, idx: usize }{
+        .{ .key = "su_col_label", .idx = @intFromEnum(layout.SuCol.label) },
+        .{ .key = "su_col_status", .idx = @intFromEnum(layout.SuCol.status) },
+        .{ .key = "su_col_atload", .idx = @intFromEnum(layout.SuCol.at_load) },
+        .{ .key = "su_col_keepalive", .idx = @intFromEnum(layout.SuCol.keep_alive) },
+        .{ .key = "su_col_type", .idx = @intFromEnum(layout.SuCol.su_type) },
+    };
+    for (su_keys) |entry| {
+        const val = native_ui.defaults_get_float(entry.key.ptr, state.su_col_widths[entry.idx]);
+        if (val >= 30.0 and val <= 600.0) state.su_col_widths[entry.idx] = val;
+    }
 }
 
 /// Save current preferences to NSUserDefaults and notify other procz processes.
@@ -638,6 +790,18 @@ fn savePreferences() void {
     const col_keys = [6][]const u8{ "col_pid", "col_name", "col_cpu", "col_mem", "col_disk", "col_gpu" };
     for (col_keys, 0..) |key, i| {
         native_ui.defaults_set_float(key.ptr, state.col_widths[i]);
+    }
+
+    // Save startup column widths (indexed by logical col, skipping grow col 1)
+    const su_save_keys = [_]struct { key: []const u8, idx: usize }{
+        .{ .key = "su_col_label", .idx = @intFromEnum(layout.SuCol.label) },
+        .{ .key = "su_col_status", .idx = @intFromEnum(layout.SuCol.status) },
+        .{ .key = "su_col_atload", .idx = @intFromEnum(layout.SuCol.at_load) },
+        .{ .key = "su_col_keepalive", .idx = @intFromEnum(layout.SuCol.keep_alive) },
+        .{ .key = "su_col_type", .idx = @intFromEnum(layout.SuCol.su_type) },
+    };
+    for (su_save_keys) |entry| {
+        native_ui.defaults_set_float(entry.key.ptr, state.su_col_widths[entry.idx]);
     }
 }
 
@@ -722,9 +886,11 @@ export fn frame() void {
         .a = 1.0,
     };
 
-    // Update cursor blink timer
-    state.cursor_blink_timer += @as(f64, @floatCast(sapp.frameDuration()));
-    if (state.cursor_blink_timer >= 1.0) state.cursor_blink_timer -= 1.0;
+    // Update cursor blink timer (only when search bar is focused)
+    if (state.search_focused) {
+        state.cursor_blink_timer += @as(f64, @floatCast(sapp.frameDuration()));
+        if (state.cursor_blink_timer >= 1.0) state.cursor_blink_timer -= 1.0;
+    }
 
     // --- Animation lerps (ease-out, ~0.18 blend per frame at 60fps) ---
     // Search bar width
@@ -745,9 +911,14 @@ export fn frame() void {
         const diff = target - state.settings_anim;
         if (@abs(diff) < 0.005) state.settings_anim = target else state.settings_anim += diff * 0.18;
     }
-    // Tab indicator cross-fade
+    // Tab indicator cross-fade (4 tabs: 0=processes, 1=network, 2=performance, 3=startup)
     {
-        const target: f32 = if (state.active_tab == .performance) 1.0 else 0.0;
+        const target: f32 = switch (state.active_tab) {
+            .processes => 0.0,
+            .network => 1.0,
+            .performance => 2.0,
+            .startup => 3.0,
+        };
         const diff = target - state.tab_anim;
         if (@abs(diff) < 0.005) state.tab_anim = target else state.tab_anim += diff * 0.18;
     }
@@ -769,7 +940,7 @@ export fn frame() void {
         }
     }
     // Row flash decay
-    if (state.row_flash_inited) {
+    if (state.row_flash_inited and state.row_flash_map.count() > 0) {
         var to_remove_buf: [64]process.pid_t = undefined;
         var remove_count: usize = 0;
         var flash_iter = state.row_flash_map.iterator();
@@ -784,11 +955,37 @@ export fn frame() void {
             _ = state.row_flash_map.remove(pid);
         }
     }
-    // Graph/sparkline display lerp
-    graph.cpu_history.lerpDisplay();
-    graph.mem_history.lerpDisplay();
-    graph.disk_history.lerpDisplay();
-    graph.lerpCoreDisplay();
+    // Graph/sparkline display lerp (only when performance tab is active)
+    if (state.active_tab == .performance) {
+        graph.cpu_history.lerpDisplay();
+        graph.mem_history.lerpDisplay();
+        graph.disk_history.lerpDisplay();
+        graph.lerpCoreDisplay();
+    }
+
+    // Filter startup items by search text (only when startup tab is active)
+    const filtered_startup: []const process.StartupItem = if (state.active_tab != .startup)
+        &.{}
+    else if (state.search_len > 0) blk: {
+        const needle = state.search_buf[0..state.search_len];
+        var count: usize = 0;
+        for (state.startup_items) |item| {
+            if (display.caseInsensitiveContains(item.label, needle) or
+                display.caseInsensitiveContains(item.program, needle))
+                count += 1;
+        }
+        const buf = frame_alloc.alloc(process.StartupItem, count) catch break :blk state.startup_items;
+        var w: usize = 0;
+        for (state.startup_items) |item| {
+            if (display.caseInsensitiveContains(item.label, needle) or
+                display.caseInsensitiveContains(item.program, needle))
+            {
+                buf[w] = item;
+                w += 1;
+            }
+        }
+        break :blk buf[0..w];
+    } else state.startup_items;
 
     // Pre-fetch scroll position for processes tab virtualization.
     // getScrollContainerData returns data from previous frame's layout, which is fine.
@@ -796,6 +993,25 @@ export fn frame() void {
     // with the clip config (after clay.UI() opens the element).
     const proc_scroll_data = clay.getScrollContainerData(clay.ElementId.ID("scroll"));
     const proc_scroll_y: f32 = if (proc_scroll_data.found) -proc_scroll_data.scroll_position.y else 0;
+
+    const startup_scroll_data = clay.getScrollContainerData(clay.ElementId.ID("su-scroll"));
+    const startup_scroll_y: f32 = if (startup_scroll_data.found) -startup_scroll_data.scroll_position.y else 0;
+
+    const net_scroll_data = clay.getScrollContainerData(clay.ElementId.ID("net-scroll"));
+    const net_scroll_y: f32 = if (net_scroll_data.found) -net_scroll_data.scroll_position.y else 0;
+
+    // Format network stat strings for the info strip
+    const net_pkt_in_str = std.fmt.allocPrint(frame_alloc, "{d}", .{state.net_stats.packets_in}) catch "0";
+    const net_pkt_out_str = std.fmt.allocPrint(frame_alloc, "{d}", .{state.net_stats.packets_out}) catch "0";
+    const net_pkt_in_rate_str = std.fmt.allocPrint(frame_alloc, "{d:.0}/s", .{state.net_packets_in_rate}) catch "0/s";
+    const net_pkt_out_rate_str = std.fmt.allocPrint(frame_alloc, "{d:.0}/s", .{state.net_packets_out_rate}) catch "0/s";
+    const net_bytes_in_str = formatBytes(frame_alloc, state.net_stats.bytes_in);
+    const net_bytes_out_str = formatBytes(frame_alloc, state.net_stats.bytes_out);
+    const net_bytes_in_rate_str = formatBytesRate(frame_alloc, state.net_bytes_in_rate);
+    const net_bytes_out_rate_str = formatBytesRate(frame_alloc, state.net_bytes_out_rate);
+
+    // Sync chart mode to graph module
+    graph.net_chart_mode = state.net_chart_mode;
 
     // Build layout and get render commands
     const commands = layout.buildLayout(state.materialized_rows, state.materialized_summary, .{
@@ -805,13 +1021,13 @@ export fn frame() void {
         .sort_direction = state.sort_direction,
         .col_widths = state.col_widths,
         .col_order = state.col_order,
-        .dragging_header = if (state.header_drag_started) state.dragging_header else null,
+        .dragging_header = if (state.proc_drag.header_drag_started) state.proc_drag.dragging_header else null,
         .drag_header_x = state.mouse_x,
         .search_text = state.search_buf[0..state.search_len],
         .search_focused = state.search_focused,
         .cursor_visible = state.cursor_blink_timer < 0.5,
-        .cursor_pos = state.cursor_pos,
-        .selection_start = state.selection_start,
+        .cursor_pos = state.search_select.cursor_pos,
+        .selection_start = state.search_select.selection_start,
         .active_tab = state.active_tab,
         .tab_anim = state.tab_anim,
         .search_width_anim = state.search_width_anim,
@@ -820,7 +1036,31 @@ export fn frame() void {
         .hover_anim_index = state.hover_anim_index,
         .row_flash = row_flash,
         .viewport_height = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - theme.col_header_height - theme.footer_height,
+        .viewport_width = sapp.widthf() / dpi,
         .scroll_y = proc_scroll_y,
+        .startup_scroll_y = startup_scroll_y,
+        .startup_items = filtered_startup,
+        .su_col_widths = state.su_col_widths,
+        .su_col_order = state.su_col_order,
+        .su_dragging_header = if (state.su_drag.header_drag_started) state.su_drag.dragging_header else null,
+        .su_drag_header_x = state.mouse_x,
+        .net_col_widths = state.net_col_widths,
+        .net_col_order = state.net_col_order,
+        .net_dragging_header = if (state.net_drag.header_drag_started) state.net_drag.dragging_header else null,
+        .net_drag_header_x = state.mouse_x,
+        .net_scroll_y = net_scroll_y,
+        .connections = state.connections,
+        .conn_names = &state.conn_names,
+        .frame_alloc = frame_alloc,
+        .net_packets_in_str = net_pkt_in_str,
+        .net_packets_out_str = net_pkt_out_str,
+        .net_packets_in_rate_str = net_pkt_in_rate_str,
+        .net_packets_out_rate_str = net_pkt_out_rate_str,
+        .net_bytes_in_str = net_bytes_in_str,
+        .net_bytes_out_str = net_bytes_out_str,
+        .net_bytes_in_rate_str = net_bytes_in_rate_str,
+        .net_bytes_out_rate_str = net_bytes_out_rate_str,
+        .net_chart_mode = state.net_chart_mode,
     }, .{
         .settings_open = state.settings_open,
         .settings_anim = state.settings_anim,
@@ -833,10 +1073,12 @@ export fn frame() void {
         const disk_id = clay.ElementId.ID("ga-disk").id;
         const spark_id = clay.ElementId.ID("spark-area").id;
         const search_id = clay.ElementId.ID("search-bar").id;
+        const net_id = clay.ElementId.ID("ga-net").id;
         graph.cpu_bounds = null;
         graph.mem_bounds = null;
         graph.disk_bounds = null;
         graph.spark_bounds = null;
+        graph.net_graph_bounds = null;
         for (commands) |cmd| {
             if (cmd.command_type == .rectangle) {
                 const bb = cmd.bounding_box;
@@ -848,8 +1090,21 @@ export fn frame() void {
                     graph.disk_bounds = .{ .x = bb.x, .y = bb.y, .w = bb.width, .h = bb.height };
                 } else if (cmd.id == spark_id) {
                     graph.spark_bounds = .{ .x = bb.x, .y = bb.y, .w = bb.width, .h = bb.height };
+                } else if (cmd.id == net_id) {
+                    graph.net_graph_bounds = .{ .x = bb.x, .y = bb.y, .w = bb.width, .h = bb.height };
                 } else if (cmd.id == search_id) {
                     state.search_bar_x = bb.x;
+                }
+            }
+        }
+
+        // Handle chart mode dropdown (native macOS popup menu)
+        if (state.mouse_clicked and state.active_tab == .network) {
+            if (clay.pointerOver(clay.ElementId.ID("net-chart-hdr"))) {
+                var items = [_][*c]const u8{ "Packets", "Data" };
+                const result = native_ui.show_dropdown_menu(@ptrCast(&items), 2, @intCast(state.net_chart_mode));
+                if (result >= 0 and result <= 1) {
+                    state.net_chart_mode = @intCast(result);
                 }
             }
         }
@@ -867,13 +1122,27 @@ export fn frame() void {
         };
     }
 
-    // Update hover for next frame (post-layout detection)
+    // Update hover for next frame (only check visible rows, not all rows)
     state.hovered_index = null;
-    for (0..display_count) |i| {
-        if (clay.pointerOver(clay.ElementId.IDI("row", @intCast(i)))) {
-            state.hovered_index = i;
-            break;
+    if (state.active_tab == .processes) {
+        const viewport_h = sapp.heightf() / dpi - theme.header_height - theme.tab_bar_height - theme.col_header_height - theme.footer_height;
+        const first_vis: usize = if (proc_scroll_y > 0)
+            @min(@as(usize, @intFromFloat(proc_scroll_y / theme.row_height)), display_count)
+        else
+            0;
+        const vis_count: usize = @as(usize, @intFromFloat(viewport_h / theme.row_height)) + 4;
+        const first_row = if (first_vis >= 2) first_vis - 2 else 0;
+        const last_row = @min(first_row + vis_count, display_count);
+        for (first_row..last_row) |i| {
+            if (clay.pointerOver(clay.ElementId.IDI("row", @intCast(i)))) {
+                state.hovered_index = i;
+                break;
+            }
         }
+        // Tell icon renderer which rows are visible (limits ID matching to ~30 rows)
+        icon_cache.visible_range = .{ .first = first_row, .count = last_row - first_row };
+    } else {
+        icon_cache.visible_range = .{ .first = 0, .count = 0 };
     }
 
     // Process click
@@ -889,10 +1158,26 @@ export fn frame() void {
     }
 
     // Update cursor: resize / grab / default
-    if (state.dragging_col != null) {
+    if (state.proc_drag.dragging_col != null or state.su_drag.dragging_col != null or state.net_drag.dragging_col != null) {
         sapp.setMouseCursor(.RESIZE_EW);
-    } else if (state.header_drag_started) {
+    } else if (state.proc_drag.header_drag_started or state.su_drag.header_drag_started or state.net_drag.header_drag_started) {
         sapp.setMouseCursor(.RESIZE_ALL);
+    } else if (state.active_tab == .network) {
+        const net_cfg = netColumnConfig();
+        if (column_ops.hitTestEdge(state.mouse_x, state.mouse_y, net_cfg) != null)
+            sapp.setMouseCursor(.RESIZE_EW)
+        else if (column_ops.hitTestHeader(state.mouse_x, state.mouse_y, net_cfg) != null)
+            sapp.setMouseCursor(.POINTING_HAND)
+        else
+            sapp.setMouseCursor(.DEFAULT);
+    } else if (state.active_tab == .startup) {
+        const su_cfg = suColumnConfig();
+        if (column_ops.hitTestEdge(state.mouse_x, state.mouse_y, su_cfg) != null)
+            sapp.setMouseCursor(.RESIZE_EW)
+        else if (column_ops.hitTestHeader(state.mouse_x, state.mouse_y, su_cfg) != null)
+            sapp.setMouseCursor(.POINTING_HAND)
+        else
+            sapp.setMouseCursor(.DEFAULT);
     } else if (hitTestColumnEdge(state.mouse_x, state.mouse_y) != null) {
         sapp.setMouseCursor(.RESIZE_EW);
     } else if (hitTestColumnHeader(state.mouse_x, state.mouse_y) != null) {
@@ -907,6 +1192,13 @@ export fn frame() void {
 
     // Set visible PIDs for icon rendering
     icon_cache.visible_pids = state.materialized_pids;
+
+    // Register scrollbars for overlay rendering
+    scrollbar.reset();
+    scrollbar.addFromClay("scroll", .{});
+    scrollbar.addFromClay("perf-scroll", .{});
+    scrollbar.addFromClay("net-scroll", .{});
+    scrollbar.addFromClay("su-scroll", .{});
 
     // Render
     sg.beginPass(.{
@@ -941,9 +1233,12 @@ export fn cleanup() void {
         state.queue.deinit();
     }
 
+    if (state.startup_arena_inited) state.startup_arena.deinit();
+    if (state.conn_names_arena_inited) state.conn_names_arena.deinit();
     state.exited_pids.deinit();
     state.selected_pids.deinit();
     if (state.row_flash_inited) state.row_flash_map.deinit();
+    if (state.collapsed_pids_inited) state.collapsed_pids.deinit();
 
     renderer.shutdown();
     if (state.clay_memory.len > 0) {
@@ -964,22 +1259,19 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         .MOUSE_MOVE => {
             state.mouse_x = e.mouse_x / dpi;
             state.mouse_y = e.mouse_y / dpi;
-            // Handle search bar text selection drag
-            if (state.search_dragging and state.search_len > 0) {
-                state.cursor_pos = cursorPosFromClick();
-                state.cursor_blink_timer = 0;
-            }
-            // Handle column resize drag
-            if (state.dragging_col) |col_idx| {
-                const delta = state.mouse_x - state.drag_start_x;
-                const new_width = @max(state.drag_start_width + delta, 30.0); // min 30px
-                state.col_widths[col_idx] = new_width;
-            }
-            // Handle column header reorder drag — activate after threshold
-            if (state.dragging_header != null and !state.header_drag_started) {
-                if (@abs(state.mouse_x - state.header_drag_start_x) >= state.header_drag_threshold) {
-                    state.header_drag_started = true;
+            // Scrollbar drag takes priority
+            if (scrollbar.isDragging()) {
+                scrollbar.handleMouseMove(state.mouse_x, state.mouse_y);
+            } else {
+                // Handle search bar text selection drag
+                if (state.search_select.dragging and state.search_len > 0) {
+                    state.search_select.updateDrag(cursorPosFromClick());
+                    state.cursor_blink_timer = 0;
                 }
+                // Handle column resize/reorder drag (processes + startup + network tabs)
+                state.proc_drag.handleMouseMove(state.mouse_x, &state.col_widths);
+                state.su_drag.handleMouseMove(state.mouse_x, &state.su_col_widths);
+                state.net_drag.handleMouseMove(state.mouse_x, &state.net_col_widths);
             }
         },
         .MOUSE_DOWN => {
@@ -991,19 +1283,33 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 state.mouse_x = e.mouse_x / dpi;
                 state.mouse_y = e.mouse_y / dpi;
 
-                // Check if clicking a column resize edge (highest priority)
-                if (hitTestColumnEdge(state.mouse_x, state.mouse_y)) |col_idx| {
-                    state.dragging_col = col_idx;
-                    state.drag_start_x = state.mouse_x;
-                    state.drag_start_width = state.col_widths[col_idx];
-                    // Don't set mouse_clicked — this is a resize, not a row click
-                } else if (hitTestColumnHeader(state.mouse_x, state.mouse_y)) |col_idx| {
-                    // Start potential column header drag (activates after threshold)
-                    state.dragging_header = col_idx;
-                    state.header_drag_start_x = state.mouse_x;
-                    state.header_drag_started = false;
-                    // Don't set mouse_clicked — sort is deferred to MOUSE_UP
+                // Scrollbar hit-test first — consume event if scrollbar was clicked
+                if (scrollbar.handleMouseDown(state.mouse_x, state.mouse_y)) {
                     state.mouse_down = true;
+                } else if (state.active_tab == .processes) {
+                    if (state.proc_drag.handleMouseDown(state.mouse_x, state.mouse_y, procColumnConfig(), &state.col_widths)) {
+                        state.mouse_down = true;
+                    } else {
+                        state.mouse_down = true;
+                        state.mouse_clicked = true;
+                        state.click_modifiers = e.modifiers;
+                    }
+                } else if (state.active_tab == .startup) {
+                    if (state.su_drag.handleMouseDown(state.mouse_x, state.mouse_y, suColumnConfig(), &state.su_col_widths)) {
+                        state.mouse_down = true;
+                    } else {
+                        state.mouse_down = true;
+                        state.mouse_clicked = true;
+                        state.click_modifiers = e.modifiers;
+                    }
+                } else if (state.active_tab == .network) {
+                    if (state.net_drag.handleMouseDown(state.mouse_x, state.mouse_y, netColumnConfig(), &state.net_col_widths)) {
+                        state.mouse_down = true;
+                    } else {
+                        state.mouse_down = true;
+                        state.mouse_clicked = true;
+                        state.click_modifiers = e.modifiers;
+                    }
                 } else {
                     state.mouse_down = true;
                     state.mouse_clicked = true;
@@ -1013,29 +1319,26 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
         },
         .MOUSE_UP => {
             if (e.mouse_button == .LEFT) {
+                // End scrollbar drag
+                scrollbar.handleMouseUp();
+
                 // End search bar text selection drag
-                if (state.search_dragging) {
-                    state.search_dragging = false;
-                    // Collapse empty selection (click without drag)
-                    if (state.selection_start) |ss| {
-                        if (ss == state.cursor_pos) state.selection_start = null;
-                    }
+                if (state.search_select.dragging) {
+                    state.search_select.endDrag();
                 }
-                if (state.header_drag_started) {
-                    // Finalize column reorder
-                    if (state.dragging_header) |src_col| {
-                        const drop_pos = findDropPosition(state.mouse_x);
-                        column_ops.reorder(&state.col_order, src_col, drop_pos, layout.COL_COUNT);
-                    }
-                } else if (state.dragging_header != null) {
-                    // Threshold not met — treat as a simple header click (sort)
+                // Finalize processes column reorder
+                if (state.proc_drag.handleMouseUp(state.mouse_x, procColumnConfig(), &state.col_order, layout.COL_COUNT)) {
                     state.mouse_clicked = true;
                     state.click_modifiers = e.modifiers;
                 }
-                state.dragging_header = null;
-                state.header_drag_started = false;
+
+                // Finalize startup column reorder
+                _ = state.su_drag.handleMouseUp(state.mouse_x, suColumnConfig(), &state.su_col_order, layout.SU_COL_COUNT);
+
+                // Finalize network column reorder
+                _ = state.net_drag.handleMouseUp(state.mouse_x, netColumnConfig(), &state.net_col_order, layout.NET_COL_COUNT);
+
                 state.mouse_down = false;
-                state.dragging_col = null;
             }
         },
         .MOUSE_SCROLL => {
@@ -1052,16 +1355,16 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 // Only accept printable ASCII (space through tilde)
                 if (cp >= 32 and cp < 127) {
                     // Delete selection first if one exists
-                    if (state.selection_start != null) deleteSelection();
+                    if (state.search_select.selection_start != null) deleteSelection();
                     if (state.search_len < state.search_buf.len - 1) {
                         // Shift text after cursor right to make room
                         var j: usize = state.search_len;
-                        while (j > state.cursor_pos) : (j -= 1) {
+                        while (j > state.search_select.cursor_pos) : (j -= 1) {
                             state.search_buf[j] = state.search_buf[j - 1];
                         }
-                        state.search_buf[state.cursor_pos] = @intCast(cp);
+                        state.search_buf[state.search_select.cursor_pos] = @intCast(cp);
                         state.search_len += 1;
-                        state.cursor_pos += 1;
+                        state.search_select.cursor_pos += 1;
                         state.cursor_blink_timer = 0;
                     }
                 }
@@ -1077,29 +1380,29 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 },
                 .BACKSPACE => {
                     if (state.search_focused) {
-                        if (state.selection_start != null) {
+                        if (state.search_select.selection_start != null) {
                             deleteSelection();
                             state.cursor_blink_timer = 0;
-                        } else if (state.cursor_pos > 0) {
+                        } else if (state.search_select.cursor_pos > 0) {
                             // Shift text after cursor left
-                            var j: usize = state.cursor_pos - 1;
+                            var j: usize = state.search_select.cursor_pos - 1;
                             while (j + 1 < state.search_len) : (j += 1) {
                                 state.search_buf[j] = state.search_buf[j + 1];
                             }
                             state.search_buf[state.search_len - 1] = 0;
                             state.search_len -= 1;
-                            state.cursor_pos -= 1;
+                            state.search_select.cursor_pos -= 1;
                             state.cursor_blink_timer = 0;
                         }
                     }
                 },
                 .DELETE => {
                     if (state.search_focused) {
-                        if (state.selection_start != null) {
+                        if (state.search_select.selection_start != null) {
                             deleteSelection();
                             state.cursor_blink_timer = 0;
-                        } else if (state.cursor_pos < state.search_len) {
-                            var j: usize = state.cursor_pos;
+                        } else if (state.search_select.cursor_pos < state.search_len) {
+                            var j: usize = state.search_select.cursor_pos;
                             while (j + 1 < state.search_len) : (j += 1) {
                                 state.search_buf[j] = state.search_buf[j + 1];
                             }
@@ -1111,24 +1414,24 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 },
                 .LEFT => {
                     if (state.search_focused) {
-                        if (state.selection_start != null) {
-                            const ss = state.selection_start.?;
-                            state.cursor_pos = @min(ss, state.cursor_pos);
-                            state.selection_start = null;
-                        } else if (state.cursor_pos > 0) {
-                            state.cursor_pos -= 1;
+                        if (state.search_select.selection_start != null) {
+                            const ss = state.search_select.selection_start.?;
+                            state.search_select.cursor_pos = @min(ss, state.search_select.cursor_pos);
+                            state.search_select.selection_start = null;
+                        } else if (state.search_select.cursor_pos > 0) {
+                            state.search_select.cursor_pos -= 1;
                         }
                         state.cursor_blink_timer = 0;
                     }
                 },
                 .RIGHT => {
                     if (state.search_focused) {
-                        if (state.selection_start != null) {
-                            const ss = state.selection_start.?;
-                            state.cursor_pos = @max(ss, state.cursor_pos);
-                            state.selection_start = null;
-                        } else if (state.cursor_pos < state.search_len) {
-                            state.cursor_pos += 1;
+                        if (state.search_select.selection_start != null) {
+                            const ss = state.search_select.selection_start.?;
+                            state.search_select.cursor_pos = @max(ss, state.search_select.cursor_pos);
+                            state.search_select.selection_start = null;
+                        } else if (state.search_select.cursor_pos < state.search_len) {
+                            state.search_select.cursor_pos += 1;
                         }
                         state.cursor_blink_timer = 0;
                     }
@@ -1136,26 +1439,25 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 .A => {
                     // Cmd+A: select all text in search bar
                     if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0 and state.search_len > 0) {
-                        state.selection_start = 0;
-                        state.cursor_pos = state.search_len;
+                        state.search_select.selection_start = 0;
+                        state.search_select.cursor_pos = state.search_len;
                         state.cursor_blink_timer = 0;
                     }
                 },
                 .C => {
                     // Cmd+C: copy selected text (or all if no selection) to clipboard
                     if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0 and state.search_len > 0) {
-                        const text = if (state.selection_start) |ss| blk: {
-                            const lo = @min(ss, state.cursor_pos);
-                            const hi = @max(ss, state.cursor_pos);
-                            break :blk if (lo != hi) state.search_buf[lo..hi] else state.search_buf[0..state.search_len];
-                        } else state.search_buf[0..state.search_len];
+                        const text = if (state.search_select.selectedRange(state.search_len)) |r|
+                            state.search_buf[r.lo..r.hi]
+                        else
+                            state.search_buf[0..state.search_len];
                         native_ui.clipboard_set_string(text.ptr, @intCast(text.len));
                     }
                 },
                 .V => {
                     // Cmd+V: paste text from clipboard into search bar
                     if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0) {
-                        if (state.selection_start != null) deleteSelection();
+                        if (state.search_select.selection_start != null) deleteSelection();
                         var paste_buf: [128]u8 = undefined;
                         const paste_len: usize = @intCast(@max(native_ui.clipboard_get_string(&paste_buf, @intCast(state.search_buf.len - 1 - state.search_len)), 0));
                         if (paste_len > 0) {
@@ -1163,7 +1465,7 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                             const to_insert = @min(paste_len, avail);
                             // Shift existing text right
                             var j: usize = state.search_len + to_insert;
-                            while (j > state.cursor_pos + to_insert) {
+                            while (j > state.search_select.cursor_pos + to_insert) {
                                 j -= 1;
                                 state.search_buf[j] = state.search_buf[j - to_insert];
                             }
@@ -1171,20 +1473,20 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                             var inserted: usize = 0;
                             for (paste_buf[0..to_insert]) |ch| {
                                 if (ch >= 32 and ch < 127) {
-                                    state.search_buf[state.cursor_pos + inserted] = ch;
+                                    state.search_buf[state.search_select.cursor_pos + inserted] = ch;
                                     inserted += 1;
                                 }
                             }
                             // If we filtered some chars, shift back
                             if (inserted < to_insert) {
                                 const diff = to_insert - inserted;
-                                var k: usize = state.cursor_pos + inserted;
+                                var k: usize = state.search_select.cursor_pos + inserted;
                                 while (k + diff < state.search_len + to_insert) : (k += 1) {
                                     state.search_buf[k] = state.search_buf[k + diff];
                                 }
                             }
                             state.search_len += inserted;
-                            state.cursor_pos += inserted;
+                            state.search_select.cursor_pos += inserted;
                             state.cursor_blink_timer = 0;
                         }
                     }
@@ -1192,22 +1494,17 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                 .X => {
                     // Cmd+X: cut selected text to clipboard
                     if (state.search_focused and (e.modifiers & sapp.modifier_super) != 0 and state.search_len > 0) {
-                        if (state.selection_start) |ss| {
-                            const lo = @min(ss, state.cursor_pos);
-                            const hi = @max(ss, state.cursor_pos);
-                            if (lo != hi) {
-                                native_ui.clipboard_set_string(state.search_buf[lo..hi].ptr, @intCast(hi - lo));
-                                deleteSelection();
-                                state.cursor_blink_timer = 0;
-                            }
+                        if (state.search_select.selectedRange(state.search_len)) |r| {
+                            native_ui.clipboard_set_string(state.search_buf[r.lo..r.hi].ptr, @intCast(r.hi - r.lo));
+                            deleteSelection();
+                            state.cursor_blink_timer = 0;
                         }
                     }
                 },
                 .ESCAPE => {
                     if (state.search_focused) {
                         state.search_len = 0;
-                        state.cursor_pos = 0;
-                        state.selection_start = null;
+                        state.search_select.clear();
                         @memset(&state.search_buf, 0);
                         state.search_focused = false;
                     } else if (state.settings_open) {
@@ -1215,9 +1512,9 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
                     }
                 },
                 .SLASH => {
-                    if (!state.search_focused and !state.settings_open) {
+                    if (!state.search_focused and !state.settings_open and state.active_tab != .performance and state.active_tab != .network) {
                         state.search_focused = true;
-                        state.cursor_pos = state.search_len;
+                        state.search_select.cursor_pos = state.search_len;
                         state.cursor_blink_timer = 0;
                         state.consume_next_char = true; // suppress the '/' CHAR event
                     }
@@ -1230,6 +1527,7 @@ export fn onEvent(ev: [*c]const sapp.Event) void {
 }
 
 fn procColumnConfig() column_ops.ColumnConfig {
+    const dpi = sapp.dpiScale();
     return .{
         .col_widths = &state.col_widths,
         .col_order = &state.col_order,
@@ -1238,6 +1536,35 @@ fn procColumnConfig() column_ops.ColumnConfig {
         .header_top = theme.header_height + theme.tab_bar_height,
         .header_height = theme.col_header_height,
         .left_pad = 14.0,
+        .viewport_width = sapp.widthf() / dpi,
+    };
+}
+
+fn suColumnConfig() column_ops.ColumnConfig {
+    const dpi = sapp.dpiScale();
+    return .{
+        .col_widths = &state.su_col_widths,
+        .col_order = &state.su_col_order,
+        .col_count = layout.SU_COL_COUNT,
+        .grow_col_idx = @intFromEnum(layout.SuCol.program),
+        .header_top = theme.header_height + theme.tab_bar_height,
+        .header_height = theme.col_header_height,
+        .left_pad = 14.0,
+        .viewport_width = sapp.widthf() / dpi,
+    };
+}
+
+fn netColumnConfig() column_ops.ColumnConfig {
+    const dpi = sapp.dpiScale();
+    return .{
+        .col_widths = &state.net_col_widths,
+        .col_order = &state.net_col_order,
+        .col_count = layout.NET_COL_COUNT,
+        .grow_col_idx = @intFromEnum(layout.NetCol.proc_name),
+        .header_top = theme.header_height + theme.tab_bar_height,
+        .header_height = theme.col_header_height,
+        .left_pad = 14.0,
+        .viewport_width = sapp.widthf() / dpi,
     };
 }
 
@@ -1249,42 +1576,25 @@ fn hitTestColumnHeader(mx: f32, my: f32) ?u8 {
     return column_ops.hitTestHeader(mx, my, procColumnConfig());
 }
 
-fn findDropPosition(mx: f32) u8 {
-    return column_ops.findDropPos(mx, procColumnConfig());
-}
+
 
 /// Compute cursor position in search text from mouse click X coordinate.
 fn cursorPosFromClick() usize {
     // Text starts after: search_bar_x + padding(12) + icon_width + gap(6)
     const icon_w = font.measure("\xe2\x8c\x98", 12).w;
     const text_x = state.search_bar_x + 12.0 + icon_w + 6.0;
-    const rel_x = state.mouse_x - text_x;
-    if (rel_x <= 0) return 0;
-
-    const text = state.search_buf[0..state.search_len];
-    for (1..text.len + 1) |i| {
-        const w = font.measure(text[0..i], 14).w;
-        if (rel_x < w) {
-            const prev_w = if (i > 1) font.measure(text[0..i - 1], 14).w else 0;
-            const mid = (prev_w + w) / 2.0;
-            return if (rel_x < mid) i - 1 else i;
-        }
-    }
-    return text.len;
+    return text_select.hitTestText(state.mouse_x, text_x, state.search_buf[0..state.search_len], 14);
 }
 
 /// Delete the selected text range and collapse cursor to the start of the selection.
 fn deleteSelection() void {
-    const ss = state.selection_start orelse return;
-    const lo = @min(ss, state.cursor_pos);
-    const hi = @max(ss, state.cursor_pos);
-    if (lo == hi) {
-        state.selection_start = null;
+    const r = state.search_select.selectedRange(state.search_len) orelse {
+        state.search_select.selection_start = null;
         return;
-    }
-    const sel_len = hi - lo;
+    };
+    const sel_len = r.hi - r.lo;
     // Shift text from hi..search_len down to lo
-    var j: usize = lo;
+    var j: usize = r.lo;
     while (j + sel_len < state.search_len) : (j += 1) {
         state.search_buf[j] = state.search_buf[j + sel_len];
     }
@@ -1293,8 +1603,8 @@ fn deleteSelection() void {
         state.search_buf[j] = 0;
     }
     state.search_len -= sel_len;
-    state.cursor_pos = lo;
-    state.selection_start = null;
+    state.search_select.cursor_pos = r.lo;
+    state.search_select.selection_start = null;
 }
 
 const NavDirection = enum { up, down };
@@ -1407,8 +1717,24 @@ fn processClick() void {
         state.active_tab = .processes;
         return;
     }
+    if (clay.pointerOver(clay.ElementId.ID("tab-network"))) {
+        state.active_tab = .network;
+        if (state.search_focused) {
+            state.search_focused = false;
+            state.search_select.clear();
+        }
+        return;
+    }
     if (clay.pointerOver(clay.ElementId.ID("tab-perf"))) {
         state.active_tab = .performance;
+        if (state.search_focused) {
+            state.search_focused = false;
+            state.search_select.clear();
+        }
+        return;
+    }
+    if (clay.pointerOver(clay.ElementId.ID("tab-startup"))) {
+        state.active_tab = .startup;
         return;
     }
 
@@ -1417,21 +1743,35 @@ fn processClick() void {
         state.search_focused = true;
         state.cursor_blink_timer = 0;
         // Position cursor based on click location
-        if (state.search_len > 0 and state.search_bar_x > 0) {
-            state.cursor_pos = cursorPosFromClick();
-        } else {
-            state.cursor_pos = state.search_len;
-        }
-        state.selection_start = state.cursor_pos; // anchor for potential drag
-        state.search_dragging = true;
+        const cp = if (state.search_len > 0 and state.search_bar_x > 0)
+            cursorPosFromClick()
+        else
+            state.search_len;
+        state.search_select.beginDrag(cp);
         return;
     } else if (state.search_focused) {
         state.search_focused = false;
-        state.selection_start = null;
+        state.search_select.clear();
     }
 
     // Check column header clicks for sorting
     if (processHeaderClick()) return;
+
+    // Check disclosure triangle clicks (tree expand/collapse)
+    if (state.collapsed_pids_inited and state.active_tab == .processes) {
+        const rows = state.materialized_rows;
+        for (rows, 0..) |row, i| {
+            if (row.is_parent and clay.pointerOver(clay.ElementId.IDI("tree", @intCast(i)))) {
+                if (state.collapsed_pids.contains(row.pid)) {
+                    _ = state.collapsed_pids.remove(row.pid);
+                } else {
+                    state.collapsed_pids.put(row.pid, {}) catch {};
+                }
+                state.display_dirty = true;
+                return;
+            }
+        }
+    }
 
     const pids = state.materialized_pids;
 
@@ -1614,6 +1954,7 @@ pub fn main() void {
         .width = 1024,
         .height = 800,
         .high_dpi = true,
+        .swap_interval = 2, // 60fps on 120Hz ProMotion, 30fps on 60Hz — plenty for a process monitor
         .window_title = "procz",
         .icon = .{ .sokol_default = true },
         .logger = .{ .func = slog.func },

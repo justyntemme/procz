@@ -13,6 +13,9 @@ pub const ThreadArgs = struct {
     mutex: *std.Thread.Mutex,
 };
 
+var snapshot_count: usize = 0;
+var has_startup_items: bool = false;
+
 pub fn run(args: ThreadArgs) void {
     var watcher = platform.ExitWatcher.init() catch {
         print("procz: kqueue init failed, falling back to polling-only\n", .{});
@@ -52,10 +55,20 @@ fn collectAndPush(args: ThreadArgs, watcher: *platform.ExitWatcher) void {
     }
     watcher.registerPids(pid_slice);
 
+    // Collect startup items: every snapshot for the first 20 (~60s),
+    // then every 30th (~90s). Keeps retrying until found.
+    const startup = if (!has_startup_items or snapshot_count < 20 or snapshot_count % 30 == 0)
+        platform.collectStartupItems(arena)
+    else
+        &[_]process.StartupItem{};
+    if (startup.len > 0) has_startup_items = true;
+    snapshot_count +%= 1;
+
     var event = channel.Event{ .snapshot = .{
         .arena = batch_arena,
         .map = map,
         .timestamp_ns = std.time.nanoTimestamp(),
+        .startup_items = startup,
     } };
     if (!pushEvent(args, &event)) {
         event.deinit();
@@ -119,10 +132,18 @@ fn collectAndPushPollingOnly(args: ThreadArgs) void {
         return;
     };
 
+    const startup_items = if (!has_startup_items or snapshot_count < 20 or snapshot_count % 30 == 0)
+        platform.collectStartupItems(arena)
+    else
+        &[_]process.StartupItem{};
+    if (startup_items.len > 0) has_startup_items = true;
+    snapshot_count +%= 1;
+
     var event = channel.Event{ .snapshot = .{
         .arena = batch_arena,
         .map = map,
         .timestamp_ns = std.time.nanoTimestamp(),
+        .startup_items = startup_items,
     } };
     if (!pushEvent(args, &event)) {
         event.deinit();

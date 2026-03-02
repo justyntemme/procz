@@ -4,6 +4,7 @@ const clay = @import("zclay");
 const theme = @import("theme");
 const font = @import("font");
 const graph = @import("graph");
+const scrollbar = @import("scrollbar");
 const icon_cache = @import("icon_cache");
 
 const slog = sokol.log;
@@ -15,13 +16,17 @@ var frame_w: f32 = 0; // logical width
 var frame_h: f32 = 0; // logical height
 var dpi_scale: f32 = 1.0;
 
-// Scissor state — textured quads respect sgl scissors, so we only need
-// basic visibility culling (skip fully-invisible elements).
+// Scissor stack — supports nested clip containers by intersecting rects.
+const MAX_SCISSOR_DEPTH = 8;
+var scissor_stack: [MAX_SCISSOR_DEPTH]ScissorRect = undefined;
+var scissor_depth: usize = 0;
 var scissor_active: bool = false;
 var clip_x: f32 = 0;
 var clip_y: f32 = 0;
 var clip_w: f32 = 0;
 var clip_h: f32 = 0;
+
+const ScissorRect = struct { x: f32, y: f32, w: f32, h: f32 };
 
 pub fn setup() void {
     sgl.setup(.{
@@ -57,6 +62,7 @@ pub fn render(commands: []const clay.RenderCommand) void {
 
     // Reset scissor state
     scissor_active = false;
+    scissor_depth = 0;
 
     // Set up sgl orthographic projection in logical coordinates (top-left origin)
     sgl.defaults();
@@ -74,23 +80,56 @@ pub fn render(commands: []const clay.RenderCommand) void {
             .border => renderBorder(cmd),
             .scissor_start => {
                 const bb = cmd.bounding_box;
+                // Push current scissor onto stack before overwriting
+                if (scissor_active and scissor_depth < MAX_SCISSOR_DEPTH) {
+                    scissor_stack[scissor_depth] = .{ .x = clip_x, .y = clip_y, .w = clip_w, .h = clip_h };
+                    scissor_depth += 1;
+                }
+                // Compute new scissor — intersect with parent if nested
+                var new_x = bb.x;
+                var new_y = bb.y;
+                var new_r = bb.x + bb.width;
+                var new_b = bb.y + bb.height;
+                if (scissor_active) {
+                    // Intersect with current active scissor
+                    new_x = @max(new_x, clip_x);
+                    new_y = @max(new_y, clip_y);
+                    new_r = @min(new_r, clip_x + clip_w);
+                    new_b = @min(new_b, clip_y + clip_h);
+                }
+                clip_x = new_x;
+                clip_y = new_y;
+                clip_w = @max(0, new_r - new_x);
+                clip_h = @max(0, new_b - new_y);
                 scissor_active = true;
-                clip_x = bb.x;
-                clip_y = bb.y;
-                clip_w = bb.width;
-                clip_h = bb.height;
-                // scissorRectf operates in framebuffer pixels, scale from logical
                 sgl.scissorRectf(
-                    bb.x * dpi_scale,
-                    bb.y * dpi_scale,
-                    bb.width * dpi_scale,
-                    bb.height * dpi_scale,
+                    clip_x * dpi_scale,
+                    clip_y * dpi_scale,
+                    clip_w * dpi_scale,
+                    clip_h * dpi_scale,
                     true,
                 );
             },
             .scissor_end => {
-                scissor_active = false;
-                sgl.scissorRectf(0, 0, frame_w * dpi_scale, frame_h * dpi_scale, true);
+                if (scissor_depth > 0) {
+                    // Pop back to parent scissor
+                    scissor_depth -= 1;
+                    const prev = scissor_stack[scissor_depth];
+                    clip_x = prev.x;
+                    clip_y = prev.y;
+                    clip_w = prev.w;
+                    clip_h = prev.h;
+                    sgl.scissorRectf(
+                        clip_x * dpi_scale,
+                        clip_y * dpi_scale,
+                        clip_w * dpi_scale,
+                        clip_h * dpi_scale,
+                        true,
+                    );
+                } else {
+                    scissor_active = false;
+                    sgl.scissorRectf(0, 0, frame_w * dpi_scale, frame_h * dpi_scale, true);
+                }
             },
             else => {},
         }
@@ -101,6 +140,9 @@ pub fn render(commands: []const clay.RenderCommand) void {
 
     // Render graph line overlays on top of Clay elements
     graph.renderAll();
+
+    // Render scrollbar overlays
+    scrollbar.renderAll();
 
     // Log sgl errors (rate-limited)
     const err = sgl.getError();
@@ -235,6 +277,17 @@ fn renderText(cmd: clay.RenderCommand) void {
 fn renderBorder(cmd: clay.RenderCommand) void {
     const bb = cmd.bounding_box;
     const bd = cmd.render_data.border;
+    const cr = bd.corner_radius;
+    const has_radius = cr.top_left > 0 or cr.top_right > 0 or cr.bottom_left > 0 or cr.bottom_right > 0;
+
+    if (has_radius) {
+        renderRoundedBorder(bb, bd);
+    } else {
+        renderStraightBorder(bb, bd);
+    }
+}
+
+fn renderStraightBorder(bb: clay.BoundingBox, bd: clay.BorderRenderData) void {
     const c = bd.color;
     const r: u8 = @intFromFloat(c[0]);
     const g: u8 = @intFromFloat(c[1]);
@@ -278,6 +331,122 @@ fn renderBorder(cmd: clay.RenderCommand) void {
     sgl.end();
 }
 
+/// Rounded border: traces the outline of a rounded rectangle as a strip
+/// of triangles, respecting per-corner radii and per-side border widths.
+fn renderRoundedBorder(bb: clay.BoundingBox, bd: clay.BorderRenderData) void {
+    const c = bd.color;
+    const r: u8 = @intFromFloat(c[0]);
+    const g: u8 = @intFromFloat(c[1]);
+    const b: u8 = @intFromFloat(c[2]);
+    const a: u8 = @intFromFloat(c[3]);
+    const w = bd.width;
+
+    // Use the max border width as a uniform thickness for the rounded outline.
+    // Most rounded borders (like the search pill) use the same width on all sides.
+    const t_top: f32 = @floatFromInt(w.top);
+    const t_bot: f32 = @floatFromInt(w.bottom);
+    const t_left: f32 = @floatFromInt(w.left);
+    const t_right: f32 = @floatFromInt(w.right);
+
+    // If no sides have width, nothing to draw
+    if (t_top == 0 and t_bot == 0 and t_left == 0 and t_right == 0) return;
+
+    const max_r = @min(bb.width, bb.height) * 0.5;
+    const tl = @min(bd.corner_radius.top_left, max_r);
+    const tr = @min(bd.corner_radius.top_right, max_r);
+    const bl_r = @min(bd.corner_radius.bottom_left, max_r);
+    const br_r = @min(bd.corner_radius.bottom_right, max_r);
+
+    sgl.beginTriangles();
+    sgl.c4b(r, g, b, a);
+
+    // Top edge (straight segment between top-left and top-right corners)
+    if (t_top > 0) {
+        emitQuadAsTriangles(bb.x + tl, bb.y, bb.width - tl - tr, t_top);
+    }
+
+    // Bottom edge
+    if (t_bot > 0) {
+        emitQuadAsTriangles(bb.x + bl_r, bb.y + bb.height - t_bot, bb.width - bl_r - br_r, t_bot);
+    }
+
+    // Left edge (straight segment between top-left and bottom-left corners)
+    if (t_left > 0) {
+        emitQuadAsTriangles(bb.x, bb.y + tl, t_left, bb.height - tl - bl_r);
+    }
+
+    // Right edge
+    if (t_right > 0) {
+        emitQuadAsTriangles(bb.x + bb.width - t_right, bb.y + tr, t_right, bb.height - tr - br_r);
+    }
+
+    // Corner arcs — drawn as ring segments (outer arc to inner arc)
+    const segments: usize = 8;
+
+    // Top-left corner
+    if (tl > 0) {
+        const inner_tl = @max(0, tl - @max(t_top, t_left));
+        cornerRing(bb.x + tl, bb.y + tl, tl, inner_tl, std.math.pi, std.math.pi * 1.5, segments);
+    }
+
+    // Top-right corner
+    if (tr > 0) {
+        const inner_tr = @max(0, tr - @max(t_top, t_right));
+        cornerRing(bb.x + bb.width - tr, bb.y + tr, tr, inner_tr, std.math.pi * 1.5, std.math.pi * 2.0, segments);
+    }
+
+    // Bottom-right corner
+    if (br_r > 0) {
+        const inner_br = @max(0, br_r - @max(t_bot, t_right));
+        cornerRing(bb.x + bb.width - br_r, bb.y + bb.height - br_r, br_r, inner_br, 0, std.math.pi * 0.5, segments);
+    }
+
+    // Bottom-left corner
+    if (bl_r > 0) {
+        const inner_bl = @max(0, bl_r - @max(t_bot, t_left));
+        cornerRing(bb.x + bl_r, bb.y + bb.height - bl_r, bl_r, inner_bl, std.math.pi * 0.5, std.math.pi, segments);
+    }
+
+    sgl.end();
+}
+
+/// Draw a ring segment (arc strip) between an outer and inner radius.
+fn cornerRing(cx: f32, cy: f32, outer_r: f32, inner_r: f32, start: f32, end: f32, segments: usize) void {
+    if (outer_r <= 0) return;
+    const step = (end - start) / @as(f32, @floatFromInt(segments));
+
+    var i: usize = 0;
+    while (i < segments) : (i += 1) {
+        const a0 = start + step * @as(f32, @floatFromInt(i));
+        const a1 = start + step * @as(f32, @floatFromInt(i + 1));
+        const cos0 = @cos(a0);
+        const sin0 = @sin(a0);
+        const cos1 = @cos(a1);
+        const sin1 = @sin(a1);
+
+        // Outer edge
+        const ox0 = cx + cos0 * outer_r;
+        const oy0 = cy + sin0 * outer_r;
+        const ox1 = cx + cos1 * outer_r;
+        const oy1 = cy + sin1 * outer_r;
+
+        // Inner edge
+        const ix0 = cx + cos0 * inner_r;
+        const iy0 = cy + sin0 * inner_r;
+        const ix1 = cx + cos1 * inner_r;
+        const iy1 = cy + sin1 * inner_r;
+
+        // Two triangles forming a quad strip segment
+        sgl.v2f(ox0, oy0);
+        sgl.v2f(ox1, oy1);
+        sgl.v2f(ix0, iy0);
+
+        sgl.v2f(ix0, iy0);
+        sgl.v2f(ox1, oy1);
+        sgl.v2f(ix1, iy1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App icon rendering pass
 // ---------------------------------------------------------------------------
@@ -316,13 +485,21 @@ fn renderIcons(commands: []const clay.RenderCommand) void {
     );
 
     // Build a lookup map: element ID → PID index.
-    // Due to row virtualization, only ~30 rows have Clay elements at a time,
-    // but their indices span the full materialized array (e.g. 200..230).
-    // We pre-compute all IDI("ico", i) hashes for the full pid list (up to 2048).
-    const max_rows: usize = @min(pids.len, 2048);
-    var id_map: [2048]u32 = undefined;
-    for (0..max_rows) |i| {
-        id_map[i] = clay.ElementId.IDI("ico", @intCast(i)).id;
+    // Only pre-compute IDs for the visible row range (~30 rows) instead of
+    // all 2048. This reduces the inner matching loop from O(2048) to O(~30).
+    const range = icon_cache.visible_range;
+    const max_rows: usize = pids.len;
+    const start = @min(range.first, max_rows);
+    const end = @min(start + range.count, max_rows);
+    const id_count = end - start;
+    if (id_count == 0) return;
+
+    var id_map: [128]u32 = undefined; // 128 is more than enough for visible rows
+    var id_indices: [128]usize = undefined;
+    const count = @min(id_count, 128);
+    for (0..count) |i| {
+        id_map[i] = clay.ElementId.IDI("ico", @intCast(start + i)).id;
+        id_indices[i] = start + i;
     }
 
     // Scan commands for icon elements (16×16 rects)
@@ -335,8 +512,8 @@ fn renderIcons(commands: []const clay.RenderCommand) void {
         // Clip test against scroll area
         if (bb.y + bb.height <= sc.y or bb.y >= sc.y + sc.h) continue;
 
-        // Match against pre-computed IDs
-        for (id_map[0..max_rows], 0..) |expected_id, idx| {
+        // Match against pre-computed IDs (only visible rows)
+        for (id_map[0..count], id_indices[0..count]) |expected_id, idx| {
             if (cmd.id == expected_id) {
                 const pid = pids[idx];
                 if (icon_cache.getOrLoad(pid)) |uv| {

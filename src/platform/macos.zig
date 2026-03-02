@@ -34,13 +34,120 @@ const c = @cImport({
     @cInclude("sys/resource.h");
     @cInclude("mach/mach.h");
     @cInclude("macos_gpu.h");
+    @cInclude("macos_startup.h");
     @cInclude("arpa/inet.h");
+    @cInclude("ifaddrs.h");
+    @cInclude("net/if.h");
+    @cInclude("net/if_dl.h");
 });
 
 /// Collect data for a single process by PID. Returns null if the process
 /// doesn't exist or isn't accessible.
 pub fn collectProcess(arena: std.mem.Allocator, pid: _pid_t) ?_Proc {
     return collectProcEntry(arena, pid);
+}
+
+/// Collect command-line arguments and environment variables for a PID
+/// via KERN_PROCARGS2 sysctl. Returns null on EPERM/ESRCH (other user's
+/// process or process not found).
+pub fn collectProcessArgs(arena: std.mem.Allocator, pid: _pid_t) ?process.ProcessArgs {
+    // 1. Get max buffer size via KERN_ARGMAX
+    var argmax: c_int = 0;
+    var argmax_size: usize = @sizeOf(c_int);
+    var mib_argmax = [_]c_int{ c.CTL_KERN, c.KERN_ARGMAX };
+    if (c.sysctl(&mib_argmax, 2, @ptrCast(&argmax), &argmax_size, null, 0) != 0) {
+        return null;
+    }
+    const buf_size: usize = @intCast(argmax);
+
+    // 2. Allocate buffer and fill via KERN_PROCARGS2
+    const buf = arena.alloc(u8, buf_size) catch return null;
+    var actual_size: usize = buf_size;
+    var mib = [_]c_int{ c.CTL_KERN, c.KERN_PROCARGS2, @intCast(pid) };
+    if (c.sysctl(&mib, 3, buf.ptr, &actual_size, null, 0) != 0) {
+        return null;
+    }
+    if (actual_size < 4) return null;
+    const data = buf[0..actual_size];
+
+    // 3. Parse: argc (4 bytes), exec_path, null padding, argv strings, env strings
+    const argc: u32 = @bitCast(data[0..4].*);
+
+    // Skip exec_path (null-terminated)
+    var pos: usize = 4;
+    while (pos < data.len and data[pos] != 0) : (pos += 1) {}
+    // Skip null padding after exec_path
+    while (pos < data.len and data[pos] == 0) : (pos += 1) {}
+
+    // 4. Read argc argv strings
+    var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var argv_count: u32 = 0;
+    while (argv_count < argc and pos < data.len) {
+        const start = pos;
+        while (pos < data.len and data[pos] != 0) : (pos += 1) {}
+        if (pos > start) {
+            argv_list.append(arena, data[start..pos]) catch {};
+        }
+        argv_count += 1;
+        pos += 1; // skip null terminator
+    }
+
+    // 5. Remaining strings are environment variables
+    var env_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var env_count: usize = 0;
+    const max_env: usize = 500;
+    while (pos < data.len and env_count < max_env) {
+        const start = pos;
+        while (pos < data.len and data[pos] != 0) : (pos += 1) {}
+        if (pos > start) {
+            env_list.append(arena, data[start..pos]) catch {};
+            env_count += 1;
+        }
+        pos += 1; // skip null terminator
+        // Stop at first empty string (consecutive nulls)
+        if (pos < data.len and data[pos] == 0) break;
+    }
+
+    return process.ProcessArgs{
+        .argv = argv_list.toOwnedSlice(arena) catch &.{},
+        .environ = env_list.toOwnedSlice(arena) catch &.{},
+    };
+}
+
+/// Collect all loaded LaunchAgents/LaunchDaemons via ServiceManagement.
+pub fn collectStartupItems(arena: std.mem.Allocator) []process.StartupItem {
+    const result = c.get_startup_items();
+    defer c.free_startup_items(result);
+
+    if (result.count <= 0 or result.items == null) return &.{};
+
+    const count: usize = @intCast(result.count);
+    const items = arena.alloc(process.StartupItem, count) catch return &.{};
+    var out_count: usize = 0;
+
+    for (0..count) |i| {
+        const ci = result.items[i];
+        const label_slice = if (ci.label != null)
+            std.mem.sliceTo(ci.label, 0)
+        else
+            "";
+        const program_slice = if (ci.program != null)
+            std.mem.sliceTo(ci.program, 0)
+        else
+            "";
+
+        items[out_count] = .{
+            .label = arena.dupe(u8, label_slice) catch continue,
+            .program = arena.dupe(u8, program_slice) catch continue,
+            .pid = if (ci.pid >= 0) @intCast(ci.pid) else null,
+            .run_at_load = ci.run_at_load != 0,
+            .keep_alive = ci.keep_alive != 0,
+            .is_user_agent = ci.is_user_agent != 0,
+        };
+        out_count += 1;
+    }
+
+    return items[0..out_count];
 }
 
 pub fn collectSnapshot(arena: std.mem.Allocator) PlatformError!std.AutoHashMap(_pid_t, _Proc) {
@@ -458,6 +565,327 @@ pub fn collectTcpConnections(arena: std.mem.Allocator) PlatformError![]process.T
     }
 
     return connections.toOwnedSlice(arena) catch return error.OutOfMemory;
+}
+
+/// Collect code signing and entitlement information for a process.
+/// Uses `codesign` CLI to extract signing details and entitlements.
+pub fn collectSecurityInfo(arena: std.mem.Allocator, pid: _pid_t) ?process.SecurityInfo {
+    // Get process path first
+    var path_buf: [4096]u8 = undefined;
+    const path_len = c.proc_pidpath(pid, &path_buf, path_buf.len);
+    if (path_len <= 0) return null;
+    const path = path_buf[0..@intCast(path_len)];
+
+    var info = process.SecurityInfo{};
+
+    // Run: codesign -dvv <path> — signing details on stderr
+    {
+        const null_terminated = arena.dupeZ(u8, path) catch return null;
+        const argv = [_][]const u8{ "/usr/bin/codesign", "-dvv", null_terminated };
+        var child = std.process.Child.init(&argv, arena);
+        child.stderr_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        _ = child.spawn() catch return null;
+
+        // Read pipes BEFORE wait — wait() may close file descriptors
+        var stderr_buf: [4096]u8 = undefined;
+        const stderr_read = if (child.stderr) |f| f.readAll(&stderr_buf) catch 0 else 0;
+        _ = child.wait() catch {};
+
+        // Parse stderr for relevant fields
+        const stderr = stderr_buf[0..stderr_read];
+        info.code_sign_id = parseField(stderr, "Identifier=", arena);
+        info.team_id = parseField(stderr, "TeamIdentifier=", arena);
+        info.signing_authority = parseField(stderr, "Authority=", arena);
+        info.format = parseField(stderr, "Format=", arena);
+    }
+
+    // Run: codesign -d --entitlements :- <path> — entitlements XML on stdout
+    {
+        const null_terminated = arena.dupeZ(u8, path) catch return info;
+        const argv = [_][]const u8{ "/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", null_terminated };
+        var child = std.process.Child.init(&argv, arena);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        _ = child.spawn() catch return info;
+
+        // Read BOTH pipes before wait to avoid deadlock (child blocks if pipe fills)
+        var stdout_buf: [32768]u8 = undefined;
+        var stderr_discard: [4096]u8 = undefined;
+        const stdout_read = if (child.stdout) |f| f.readAll(&stdout_buf) catch 0 else 0;
+        _ = if (child.stderr) |f| f.readAll(&stderr_discard) catch 0 else 0;
+        _ = child.wait() catch {};
+
+        if (stdout_read > 0) {
+            // codesign may prepend a binary DER header (0xFADE7171) before the XML.
+            // Find the start of the XML plist.
+            var xml_start: usize = 0;
+            const raw = stdout_buf[0..stdout_read];
+            if (std.mem.indexOf(u8, raw, "<?xml")) |pos| {
+                xml_start = pos;
+            } else if (std.mem.indexOf(u8, raw, "<plist")) |pos| {
+                xml_start = pos;
+            }
+            info.entitlements = parseEntitlements(raw[xml_start..], arena);
+
+            // Check for sandbox entitlement
+            for (info.entitlements) |ent| {
+                if (std.mem.eql(u8, ent.key, "com.apple.security.app-sandbox") and
+                    std.mem.eql(u8, ent.value, "true"))
+                {
+                    info.is_sandboxed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    return info;
+}
+
+/// Parse a "Key=Value\n" field from codesign output.
+fn parseField(data: []const u8, prefix: []const u8, arena: std.mem.Allocator) []const u8 {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        // Find start of this line
+        const line_start = offset;
+        // Find end of line
+        while (offset < data.len and data[offset] != '\n') : (offset += 1) {}
+        const line = data[line_start..offset];
+        if (offset < data.len) offset += 1; // skip \n
+
+        if (line.len > prefix.len and std.mem.startsWith(u8, line, prefix)) {
+            return arena.dupe(u8, line[prefix.len..]) catch "";
+        }
+    }
+    return "";
+}
+
+/// Simple entitlements parser for Apple plist XML.
+/// Extracts key-value pairs from the flat structure.
+fn parseEntitlements(xml: []const u8, arena: std.mem.Allocator) []const process.Entitlement {
+    var entries: std.ArrayListUnmanaged(process.Entitlement) = .empty;
+
+    var pos: usize = 0;
+    while (pos < xml.len) {
+        // Find <key>...</key>
+        const key_start_tag = "<key>";
+        const key_end_tag = "</key>";
+        const ks = std.mem.indexOfPos(u8, xml, pos, key_start_tag) orelse break;
+        const key_start = ks + key_start_tag.len;
+        const ke = std.mem.indexOfPos(u8, xml, key_start, key_end_tag) orelse break;
+        const key = xml[key_start..ke];
+        pos = ke + key_end_tag.len;
+
+        // Find the value tag (next <true/>, <false/>, <string>...</string>, <integer>...</integer>, <array>, etc.)
+        // Skip whitespace
+        while (pos < xml.len and (xml[pos] == ' ' or xml[pos] == '\t' or xml[pos] == '\n' or xml[pos] == '\r')) : (pos += 1) {}
+
+        var value: []const u8 = "";
+        if (pos < xml.len and xml[pos] == '<') {
+            if (std.mem.startsWith(u8, xml[pos..], "<true/>")) {
+                value = "true";
+                pos += "<true/>".len;
+            } else if (std.mem.startsWith(u8, xml[pos..], "<false/>")) {
+                value = "false";
+                pos += "<false/>".len;
+            } else if (std.mem.startsWith(u8, xml[pos..], "<string>")) {
+                const vs = pos + "<string>".len;
+                if (std.mem.indexOfPos(u8, xml, vs, "</string>")) |ve| {
+                    value = xml[vs..ve];
+                    pos = ve + "</string>".len;
+                }
+            } else if (std.mem.startsWith(u8, xml[pos..], "<integer>")) {
+                const vs = pos + "<integer>".len;
+                if (std.mem.indexOfPos(u8, xml, vs, "</integer>")) |ve| {
+                    value = xml[vs..ve];
+                    pos = ve + "</integer>".len;
+                }
+            } else if (std.mem.startsWith(u8, xml[pos..], "<array")) {
+                // Extract string items from array
+                if (std.mem.indexOfPos(u8, xml, pos, "</array>")) |ae| {
+                    const array_xml = xml[pos..ae];
+                    value = extractArrayStrings(array_xml, arena);
+                    pos = ae + "</array>".len;
+                } else {
+                    value = "(array)";
+                    pos += 1;
+                }
+            } else if (std.mem.startsWith(u8, xml[pos..], "<dict")) {
+                if (std.mem.indexOfPos(u8, xml, pos, "</dict>")) |de| {
+                    const dict_xml = xml[pos..de];
+                    value = extractDictEntries(dict_xml, arena);
+                    pos = de + "</dict>".len;
+                } else {
+                    value = "(dict)";
+                    pos += 1;
+                }
+            } else {
+                pos += 1;
+                continue;
+            }
+        }
+
+        entries.append(arena, .{
+            .key = arena.dupe(u8, key) catch continue,
+            .value = arena.dupe(u8, value) catch continue,
+        }) catch continue;
+    }
+
+    return entries.toOwnedSlice(arena) catch &.{};
+}
+
+/// Extract string values from an <array>...</array> XML fragment.
+/// Returns a comma-separated string of items (strings, true/false, integers).
+fn extractArrayStrings(array_xml: []const u8, arena: std.mem.Allocator) []const u8 {
+    var parts: std.ArrayListUnmanaged(u8) = .empty;
+    var apos: usize = 0;
+    var count: usize = 0;
+
+    while (apos < array_xml.len) {
+        if (std.mem.indexOfPos(u8, array_xml, apos, "<string>")) |ss| {
+            const vs = ss + "<string>".len;
+            if (std.mem.indexOfPos(u8, array_xml, vs, "</string>")) |se| {
+                if (count > 0) parts.appendSlice(arena, ", ") catch break;
+                parts.appendSlice(arena, array_xml[vs..se]) catch break;
+                apos = se + "</string>".len;
+                count += 1;
+                continue;
+            }
+        }
+        if (std.mem.indexOfPos(u8, array_xml, apos, "<true/>")) |ts| {
+            if (count > 0) parts.appendSlice(arena, ", ") catch break;
+            parts.appendSlice(arena, "true") catch break;
+            apos = ts + "<true/>".len;
+            count += 1;
+            continue;
+        }
+        if (std.mem.indexOfPos(u8, array_xml, apos, "<false/>")) |fs| {
+            if (count > 0) parts.appendSlice(arena, ", ") catch break;
+            parts.appendSlice(arena, "false") catch break;
+            apos = fs + "<false/>".len;
+            count += 1;
+            continue;
+        }
+        if (std.mem.indexOfPos(u8, array_xml, apos, "<integer>")) |is_| {
+            const ivs = is_ + "<integer>".len;
+            if (std.mem.indexOfPos(u8, array_xml, ivs, "</integer>")) |ie| {
+                if (count > 0) parts.appendSlice(arena, ", ") catch break;
+                parts.appendSlice(arena, array_xml[ivs..ie]) catch break;
+                apos = ie + "</integer>".len;
+                count += 1;
+                continue;
+            }
+        }
+        break;
+    }
+
+    if (parts.items.len == 0) return "(empty array)";
+    return parts.toOwnedSlice(arena) catch "(array)";
+}
+
+/// Collect system-wide network statistics using getifaddrs() + AF_LINK.
+/// Sums ifi_ipackets, ifi_opackets, ifi_ibytes, ifi_obytes across non-loopback interfaces.
+pub fn collectNetworkStats() process.NetworkStats {
+    var stats = process.NetworkStats{};
+
+    var ifap: ?*c.ifaddrs = null;
+    if (c.getifaddrs(&ifap) != 0) return stats;
+    defer c.freeifaddrs(ifap);
+
+    var ifa = ifap;
+    while (ifa) |iface| : (ifa = iface.ifa_next) {
+        // Only look at AF_LINK (data-link layer) entries
+        if (iface.ifa_addr == null or iface.ifa_addr.*.sa_family != c.AF_LINK) continue;
+
+        // Skip loopback interface
+        if (iface.ifa_name != null) {
+            const name = std.mem.sliceTo(iface.ifa_name, 0);
+            if (std.mem.startsWith(u8, name, "lo")) continue;
+        }
+
+        // ifa_data points to struct if_data for AF_LINK entries
+        if (iface.ifa_data) |data_ptr| {
+            const if_data: *const c.if_data = @ptrCast(@alignCast(data_ptr));
+            stats.packets_in += @intCast(if_data.ifi_ipackets);
+            stats.packets_out += @intCast(if_data.ifi_opackets);
+            stats.bytes_in += @intCast(if_data.ifi_ibytes);
+            stats.bytes_out += @intCast(if_data.ifi_obytes);
+        }
+    }
+
+    return stats;
+}
+
+/// Extract key=value pairs from a <dict>...</dict> XML fragment.
+/// Returns a comma-separated string like "key1=value1, key2=value2".
+fn extractDictEntries(dict_xml: []const u8, arena: std.mem.Allocator) []const u8 {
+    var parts: std.ArrayListUnmanaged(u8) = .empty;
+    var dpos: usize = 0;
+    var count: usize = 0;
+
+    while (dpos < dict_xml.len) {
+        // Find <key>...</key>
+        const ks = std.mem.indexOfPos(u8, dict_xml, dpos, "<key>") orelse break;
+        const key_start = ks + "<key>".len;
+        const ke = std.mem.indexOfPos(u8, dict_xml, key_start, "</key>") orelse break;
+        const key = dict_xml[key_start..ke];
+        dpos = ke + "</key>".len;
+
+        // Skip whitespace
+        while (dpos < dict_xml.len and (dict_xml[dpos] == ' ' or dict_xml[dpos] == '\t' or dict_xml[dpos] == '\n' or dict_xml[dpos] == '\r')) : (dpos += 1) {}
+
+        var val: []const u8 = "";
+        if (dpos < dict_xml.len and dict_xml[dpos] == '<') {
+            if (std.mem.startsWith(u8, dict_xml[dpos..], "<true/>")) {
+                val = "true";
+                dpos += "<true/>".len;
+            } else if (std.mem.startsWith(u8, dict_xml[dpos..], "<false/>")) {
+                val = "false";
+                dpos += "<false/>".len;
+            } else if (std.mem.startsWith(u8, dict_xml[dpos..], "<string>")) {
+                const vs = dpos + "<string>".len;
+                if (std.mem.indexOfPos(u8, dict_xml, vs, "</string>")) |ve| {
+                    val = dict_xml[vs..ve];
+                    dpos = ve + "</string>".len;
+                }
+            } else if (std.mem.startsWith(u8, dict_xml[dpos..], "<integer>")) {
+                const vs = dpos + "<integer>".len;
+                if (std.mem.indexOfPos(u8, dict_xml, vs, "</integer>")) |ve| {
+                    val = dict_xml[vs..ve];
+                    dpos = ve + "</integer>".len;
+                }
+            } else if (std.mem.startsWith(u8, dict_xml[dpos..], "<array")) {
+                if (std.mem.indexOfPos(u8, dict_xml, dpos, "</array>")) |ae| {
+                    val = extractArrayStrings(dict_xml[dpos..ae], arena);
+                    dpos = ae + "</array>".len;
+                } else {
+                    val = "(array)";
+                    dpos += 1;
+                }
+            } else if (std.mem.startsWith(u8, dict_xml[dpos..], "<dict")) {
+                // Avoid infinite recursion — show as nested
+                val = "(nested dict)";
+                if (std.mem.indexOfPos(u8, dict_xml, dpos + 1, "</dict>")) |de| {
+                    dpos = de + "</dict>".len;
+                } else {
+                    dpos += 1;
+                }
+            } else {
+                dpos += 1;
+                continue;
+            }
+        }
+
+        if (count > 0) parts.appendSlice(arena, ", ") catch break;
+        parts.appendSlice(arena, key) catch break;
+        parts.append(arena, '=') catch break;
+        parts.appendSlice(arena, val) catch break;
+        count += 1;
+    }
+
+    if (parts.items.len == 0) return "(empty dict)";
+    return parts.toOwnedSlice(arena) catch "(dict)";
 }
 
 fn makeConnection(pid: i32, coalition_id: u64, lport: u16, fport: u16, laddr: *const [16]u8, faddr: *const [16]u8, is_ipv6: bool, tcp_state: i32) process.TcpConnection {

@@ -230,16 +230,14 @@ fn computeVerticalThumb(info: ScrollbarEntry) ?ThumbRect {
     const frac = if (max_scroll > 0) @min(@max(info.scroll_y / max_scroll, 0), 1.0) else 0;
     const thumb_y = frac * (track_h - thumb_h);
 
-    // Pin to the right edge of the viewport. The container's bounding box may
-    // be stale on the first frame (zeros from getElementData before any layout),
-    // and full-width scroll containers should always have their scrollbar at
-    // the window's right edge regardless.
+    // Always pin to the viewport's right edge. Clay's scroll container
+    // dimensions come from the previous frame and can overshoot the
+    // current viewport during resizes, pushing the thumb off-screen.
     const dpi = sapp.dpiScale();
     const viewport_w = sapp.widthf() / dpi;
-    const right_edge = if (info.container_w > 0) info.x + info.container_w else viewport_w;
 
     return .{
-        .x = right_edge - THUMB_WIDTH - EDGE_MARGIN,
+        .x = viewport_w - THUMB_WIDTH - EDGE_MARGIN,
         .y = info.y + EDGE_MARGIN + thumb_y,
         .w = THUMB_WIDTH,
         .h = thumb_h,

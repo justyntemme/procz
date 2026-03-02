@@ -33,8 +33,13 @@ var atlas_image: sg.Image = .{};
 var initialized: bool = false;
 
 pub fn init() void {
-    // Read TTF file
-    const font_path = "/Users/justyntemme/Library/Fonts/FiraCodeNerdFontMono-Regular.ttf";
+    // Read TTF file from user's font directory
+    const home = std.posix.getenv("HOME") orelse "/tmp";
+    var path_buf: [512]u8 = undefined;
+    const font_path = std.fmt.bufPrint(&path_buf, "{s}/Library/Fonts/FiraCodeNerdFontMono-Regular.ttf", .{home}) catch {
+        print("font: HOME path too long\n", .{});
+        return;
+    };
     const file = std.fs.openFileAbsolute(font_path, .{}) catch |err| {
         print("font: failed to open {s}: {}\n", .{ font_path, err });
         return;
